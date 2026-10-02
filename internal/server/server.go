@@ -30,13 +30,34 @@ func Handler() http.Handler {
 // executor for POST /v1/apply. Passing a nil Provider keeps the read-only
 // surface fully usable while apply reports provider_unavailable for non-empty
 // plans. The service never persists changes itself; provider is the only
-// component that executes them.
+// component that executes them. Without a state file the state endpoints
+// report state_unavailable.
 func HandlerWithProvider(provider Provider) http.Handler {
+	return newMux(provider, nil)
+}
+
+// HandlerWithProviderAndStateFile returns the full HTTP surface backed by the
+// state file at path: GET /v1/state reports the stored revision and state,
+// and POST /v1/state/apply plans against the file and commits the evolved
+// state atomically under a non-blocking exclusive lock. The request/response
+// behavior of every other endpoint is identical to HandlerWithProvider.
+func HandlerWithProviderAndStateFile(provider Provider, path string) http.Handler {
+	return newMux(provider, newStateBackend(path))
+}
+
+func newMux(provider Provider, backend *stateBackend) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/configurations/validate", handleValidateConfiguration)
 	mux.HandleFunc("/v1/configurations/order", handleOrderConfiguration)
 	mux.HandleFunc("/v1/plans", handlePlan)
 	mux.HandleFunc("/v1/apply", handleApply(provider))
+	if backend != nil {
+		mux.HandleFunc("/v1/state", backend.handleRead)
+		mux.HandleFunc("/v1/state/apply", backend.handleApply(provider))
+	} else {
+		mux.HandleFunc("/v1/state", handleStateUnavailable)
+		mux.HandleFunc("/v1/state/apply", handleStateUnavailable)
+	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)

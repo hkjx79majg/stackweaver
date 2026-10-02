@@ -26,6 +26,15 @@ type Provider interface {
 
 `server.HandlerWithProvider(provider)` 注入执行器并返回完整 HTTP 表面；`server.Handler()` 等价于注入 `nil`。单项请求 `ChangeRequest` 携带请求的 `context.Context`、`action`、`address`、`before` 与 `after`。服务按顺序逐项调用 Provider（noop 不调用）：全部成功返回 200 及 `applied`、计划 `summary` 和由 `priorState` 演进而来的 `state`；某项失败时立即停止、不回滚，返回 502、`provider_error`（path 为 `/changes/{索引}`）及已成功的部分；有变更但未注入 Provider 时返回 503 `provider_unavailable`，空计划在无 Provider 时仍成功。
 
+## 状态文件
+
+`server.HandlerWithProviderAndStateFile(provider, path)` 在上述表面之外增加文件状态后端，执行结果成为后续请求的输入：
+
+- `GET /v1/state` 返回状态文件的 `revision` 与 `state`（沿用既有 `resources` 结构）。文件不存在视为版本 0、资源为空；文件不可读或内容不合法返回 500 `state_read_error`，且不会改写文件。
+- `POST /v1/state/apply` 只接受 `configuration` 与可选 `expectedRevision` 信封（非法信封返回 422 `invalid_state_request`），以状态文件为 priorState 校验、计划并执行。整个执行从读取到提交持有规范化路径的非阻塞排他锁（分别创建的处理器同样互斥），锁被占用时返回 409 `state_locked`；`expectedRevision` 与当前版本不符返回 409 `state_conflict` 及 `currentRevision`，且不调用 Provider。
+
+空计划成功且版本不变；全部成功后原子替换文件，`revision` 恰增 1，响应携带 `applied`、`summary`、`state` 与 `revision`。Provider 失败仍返回 502 `provider_error` 并立即停止、不回滚：首项失败保持文件不变，已有成功项则保存部分 state 并增加一次版本。提交失败返回 500 `state_write_error`，不留半写文件，原文件保持完整可读，响应保留已执行项与待提交 state。未注入 Provider 而有变更时返回 503 `provider_unavailable`；未经状态文件创建的处理器访问这两个端点返回 503 `state_unavailable`。
+
 ## 验证
 
 ```bash
