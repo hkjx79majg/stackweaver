@@ -32,11 +32,34 @@ func Handler() http.Handler {
 // plans. The service never persists changes itself; provider is the only
 // component that executes them.
 func HandlerWithProvider(provider Provider) http.Handler {
+	return newHandler(provider, "")
+}
+
+// HandlerWithProviderAndStateFile returns the full HTTP surface backed by a
+// state file at path. It serves everything HandlerWithProvider serves and
+// additionally GET /v1/state, which reports the file's revision and state,
+// and POST /v1/state/apply, which plans a configuration against the file,
+// executes the changes through provider, and atomically commits the result
+// with the revision incremented by one. A missing file reads as revision 0
+// with empty resources. Handlers created without a state file answer the
+// state endpoints with 503 state_unavailable.
+func HandlerWithProviderAndStateFile(provider Provider, path string) http.Handler {
+	return newHandler(provider, path)
+}
+
+func newHandler(provider Provider, statePath string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/configurations/validate", handleValidateConfiguration)
 	mux.HandleFunc("/v1/configurations/order", handleOrderConfiguration)
 	mux.HandleFunc("/v1/plans", handlePlan)
 	mux.HandleFunc("/v1/apply", handleApply(provider))
+	if statePath != "" {
+		mux.HandleFunc("/v1/state", handleGetState(statePath))
+		mux.HandleFunc("/v1/state/apply", handleStateApply(provider, statePath))
+	} else {
+		mux.HandleFunc("/v1/state", handleStateUnavailable)
+		mux.HandleFunc("/v1/state/apply", handleStateUnavailable)
+	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
