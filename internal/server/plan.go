@@ -66,14 +66,45 @@ func handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doc, ok := decodeConfigurationBody(w, r)
+	prepared, ok := preparePlan(w, r)
 	if !ok {
 		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(planResponse{
+		Valid:   true,
+		Errors:  []validationError{},
+		Changes: prepared.changes,
+		Summary: prepared.summary,
+	})
+}
+
+// preparedPlan is the result of the shared plan request pipeline: the ordered
+// changes and summary identical to POST /v1/plans, plus the decoded prior
+// state entries keyed by address, which execution endpoints evolve into the
+// resulting state.
+type preparedPlan struct {
+	changes []planChange
+	summary planSummary
+	// prior holds the prior state's raw resource entries keyed by address, so
+	// untouched resources keep their submitted form.
+	prior map[string]map[string]any
+}
+
+// preparePlan runs the pipeline shared by planning and execution: body
+// decoding, envelope validation, configuration/state validation and ordering,
+// and the read-only diff. Any failure writes the same 400/422 response as
+// POST /v1/plans and returns ok=false; callers must not do any further work
+// when that happens.
+func preparePlan(w http.ResponseWriter, r *http.Request) (preparedPlan, bool) {
+	doc, ok := decodeConfigurationBody(w, r)
+	if !ok {
+		return preparedPlan{}, false
 	}
 
 	configRaw, stateRaw, ok := checkPlanEnvelope(w, doc)
 	if !ok {
-		return
+		return preparedPlan{}, false
 	}
 
 	// Configuration and prior state are validated independently; their
@@ -97,17 +128,17 @@ func handlePlan(w http.ResponseWriter, r *http.Request) {
 	if len(errs) != 0 {
 		sortValidationErrors(errs)
 		writeValidation(w, http.StatusUnprocessableEntity, errs)
-		return
+		return preparedPlan{}, false
 	}
 
 	changes, summary := computePlan(configResources, configOrder, stateResources, stateOrder)
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(planResponse{
-		Valid:   true,
-		Errors:  []validationError{},
-		Changes: changes,
-		Summary: summary,
-	})
+	priorEntries := stateRaw.(map[string]any)["resources"].([]any)
+	prior := make(map[string]map[string]any, len(priorEntries))
+	for _, entry := range priorEntries {
+		obj := entry.(map[string]any)
+		prior[obj["address"].(string)] = obj
+	}
+	return preparedPlan{changes: changes, summary: summary, prior: prior}, true
 }
 
 // checkPlanEnvelope validates the request envelope: a JSON object holding
