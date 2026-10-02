@@ -39,13 +39,42 @@ type validateResponse struct {
 // creating or persisting anything.
 func handleValidateConfiguration(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	doc, ok := decodeConfigurationRequest(w, r)
+	if !ok {
+		return
+	}
+
+	errs := validateConfiguration(doc)
+	sortValidationErrors(errs)
+	if len(errs) == 0 {
+		writeValidation(w, http.StatusOK, nil)
+		return
+	}
+	writeValidation(w, http.StatusUnprocessableEntity, errs)
+}
+
+// sortValidationErrors orders findings by JSON Pointer path, then by error
+// code, as required by every endpoint that returns validation findings.
+func sortValidationErrors(errs []validationError) {
+	sort.SliceStable(errs, func(i, j int) bool {
+		if errs[i].Path != errs[j].Path {
+			return errs[i].Path < errs[j].Path
+		}
+		return errs[i].Code < errs[j].Code
+	})
+}
+
+// decodeConfigurationRequest enforces the POST-only method contract and the
+// single-JSON-value body contract shared by the configuration endpoints. It
+// writes the 405/400 response itself; ok is false when the caller must stop.
+func decodeConfigurationRequest(w http.ResponseWriter, r *http.Request) (any, bool) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"error": map[string]string{"code": "method_not_allowed"},
 		})
-		return
+		return nil, false
 	}
 
 	dec := json.NewDecoder(r.Body)
@@ -57,7 +86,7 @@ func handleValidateConfiguration(w http.ResponseWriter, r *http.Request) {
 			Message: "request body is empty or is not valid JSON",
 			Path:    "",
 		}})
-		return
+		return nil, false
 	}
 	var trailing any
 	if err := dec.Decode(&trailing); err != io.EOF {
@@ -66,21 +95,9 @@ func handleValidateConfiguration(w http.ResponseWriter, r *http.Request) {
 			Message: "request body must contain exactly one JSON value",
 			Path:    "",
 		}})
-		return
+		return nil, false
 	}
-
-	errs := validateConfiguration(doc)
-	sort.SliceStable(errs, func(i, j int) bool {
-		if errs[i].Path != errs[j].Path {
-			return errs[i].Path < errs[j].Path
-		}
-		return errs[i].Code < errs[j].Code
-	})
-	if len(errs) == 0 {
-		writeValidation(w, http.StatusOK, nil)
-		return
-	}
-	writeValidation(w, http.StatusUnprocessableEntity, errs)
+	return doc, true
 }
 
 func writeValidation(w http.ResponseWriter, status int, errs []validationError) {
