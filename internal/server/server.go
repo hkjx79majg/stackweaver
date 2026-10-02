@@ -21,6 +21,7 @@ type health struct {
 // Handler returns the HTTP surface served by the baseline.
 func Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/configurations/validate", handleValidateConfiguration)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
