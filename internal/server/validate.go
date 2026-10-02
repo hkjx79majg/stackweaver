@@ -20,6 +20,10 @@ const (
 	codeTypeMismatch            = "type_mismatch"
 	codeMissingRequiredProperty = "missing_required_property"
 	codeUnexpectedProperty      = "unexpected_property"
+	codeUnknownDependency       = "unknown_dependency"
+	codeSelfDependency          = "self_dependency"
+	codeDuplicateDependency     = "duplicate_dependency"
+	codeDependencyCycle         = "dependency_cycle"
 )
 
 // validationError is one machine-readable finding. Path is an RFC 6901 JSON
@@ -48,6 +52,24 @@ func handleValidateConfiguration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	doc, ok := decodeConfigurationBody(w, r)
+	if !ok {
+		return
+	}
+
+	errs := validateConfiguration(doc)
+	sortValidationErrors(errs)
+	if len(errs) == 0 {
+		writeValidation(w, http.StatusOK, nil)
+		return
+	}
+	writeValidation(w, http.StatusUnprocessableEntity, errs)
+}
+
+// decodeConfigurationBody reads the single JSON value expected from a
+// configuration request body. It writes the shared 400 invalid_json response
+// and returns ok=false when the body is empty, malformed, or trailing data.
+func decodeConfigurationBody(w http.ResponseWriter, r *http.Request) (any, bool) {
 	dec := json.NewDecoder(r.Body)
 	dec.UseNumber()
 	var doc any
@@ -57,7 +79,7 @@ func handleValidateConfiguration(w http.ResponseWriter, r *http.Request) {
 			Message: "request body is empty or is not valid JSON",
 			Path:    "",
 		}})
-		return
+		return nil, false
 	}
 	var trailing any
 	if err := dec.Decode(&trailing); err != io.EOF {
@@ -66,21 +88,19 @@ func handleValidateConfiguration(w http.ResponseWriter, r *http.Request) {
 			Message: "request body must contain exactly one JSON value",
 			Path:    "",
 		}})
-		return
+		return nil, false
 	}
+	return doc, true
+}
 
-	errs := validateConfiguration(doc)
+// sortValidationErrors orders findings by JSON Pointer path, then by code.
+func sortValidationErrors(errs []validationError) {
 	sort.SliceStable(errs, func(i, j int) bool {
 		if errs[i].Path != errs[j].Path {
 			return errs[i].Path < errs[j].Path
 		}
 		return errs[i].Code < errs[j].Code
 	})
-	if len(errs) == 0 {
-		writeValidation(w, http.StatusOK, nil)
-		return
-	}
-	writeValidation(w, http.StatusUnprocessableEntity, errs)
 }
 
 func writeValidation(w http.ResponseWriter, status int, errs []validationError) {
