@@ -13,12 +13,10 @@ import (
 const codeInvalidPlanRequest = "invalid_plan_request"
 
 // planSnapshot is the normalized view of one resource at one side of a
-// change: before for the prior state, after for the configuration.
-type planSnapshot struct {
-	Type       string         `json:"type"`
-	Properties map[string]any `json:"properties"`
-	DependsOn  []string       `json:"dependsOn"`
-}
+// change: before for the prior state, after for the configuration. It is an
+// alias of the exported Snapshot handed to Provider implementations so that
+// the read-only plan endpoint and the apply endpoint share one shape.
+type planSnapshot = Snapshot
 
 // planChange is one planned action. Create carries only After, delete only
 // Before, update carries both.
@@ -58,22 +56,40 @@ type planResource struct {
 func handlePlan(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]string{"code": "method_not_allowed"},
-		})
+		rejectMethodNotAllowed(w)
 		return
 	}
 
-	doc, ok := decodeConfigurationBody(w, r)
+	changes, summary, _, ok := preparePlan(w, r)
 	if !ok {
 		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(planResponse{
+		Valid:   true,
+		Errors:  []validationError{},
+		Changes: changes,
+		Summary: summary,
+	})
+}
+
+// preparePlan runs the request through the same pipeline the read-only plan
+// endpoint uses: decode the body, validate the envelope, configuration,
+// dependencies and prior state, then compute the ordered diff. On any client
+// failure it writes the 400/422 response itself and returns ok=false, so the
+// caller never invokes a Provider for an invalid request. On success it also
+// returns the validated prior-state resources, used to seed the resulting
+// state of an apply run.
+func preparePlan(w http.ResponseWriter, r *http.Request) (changes []planChange, summary planSummary, stateResources []planResource, ok bool) {
+	doc, ok := decodeConfigurationBody(w, r)
+	if !ok {
+		return nil, planSummary{}, nil, false
 	}
 
 	configRaw, stateRaw, ok := checkPlanEnvelope(w, doc)
 	if !ok {
-		return
+		return nil, planSummary{}, nil, false
 	}
 
 	// Configuration and prior state are validated independently; their
@@ -97,16 +113,20 @@ func handlePlan(w http.ResponseWriter, r *http.Request) {
 	if len(errs) != 0 {
 		sortValidationErrors(errs)
 		writeValidation(w, http.StatusUnprocessableEntity, errs)
-		return
+		return nil, planSummary{}, nil, false
 	}
 
-	changes, summary := computePlan(configResources, configOrder, stateResources, stateOrder)
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(planResponse{
-		Valid:   true,
-		Errors:  []validationError{},
-		Changes: changes,
-		Summary: summary,
+	changes, summary = computePlan(configResources, configOrder, stateResources, stateOrder)
+	return changes, summary, stateResources, true
+}
+
+// rejectMethodNotAllowed writes the shared 405 response for the POST-only
+// planning and apply endpoints: Allow: POST and a method_not_allowed code.
+func rejectMethodNotAllowed(w http.ResponseWriter) {
+	w.Header().Set("Allow", http.MethodPost)
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]string{"code": "method_not_allowed"},
 	})
 }
 

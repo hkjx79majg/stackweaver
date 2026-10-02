@@ -12,6 +12,20 @@ go run ./cmd/stackweaver
 
 服务默认监听 `127.0.0.1:8080`。可通过 `STACKWEAVER_ADDR` 修改监听地址。`GET /healthz` 返回 JSON 健康状态。
 
+## 执行计划
+
+`POST /v1/apply` 与 `POST /v1/plans` 使用相同的 `configuration` / `priorState` 信封、校验规则与确定性变更顺序；它不读取文件、环境变量或远端状态，也不在请求之间保存状态。
+
+变更的实际执行由可注入的 `server.Provider` 完成，服务自身不做任何持久化：
+
+```go
+type Provider interface {
+    Apply(req ChangeRequest) error
+}
+```
+
+`server.HandlerWithProvider(provider)` 注入执行器并返回完整 HTTP 表面；`server.Handler()` 等价于注入 `nil`。单项请求 `ChangeRequest` 携带请求的 `context.Context`、`action`、`address`、`before` 与 `after`。服务按顺序逐项调用 Provider（noop 不调用）：全部成功返回 200 及 `applied`、计划 `summary` 和由 `priorState` 演进而来的 `state`；某项失败时立即停止、不回滚，返回 502、`provider_error`（path 为 `/changes/{索引}`）及已成功的部分；有变更但未注入 Provider 时返回 503 `provider_unavailable`，空计划在无 Provider 时仍成功。
+
 ## 验证
 
 ```bash

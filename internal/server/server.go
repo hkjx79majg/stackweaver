@@ -18,12 +18,25 @@ type health struct {
 	Version string `json:"version"`
 }
 
-// Handler returns the HTTP surface served by the baseline.
+// Handler returns the HTTP surface served by the baseline. It injects no
+// Provider, so POST /v1/apply succeeds only for empty plans and answers 503
+// provider_unavailable when there is anything to execute; every other
+// endpoint is unaffected.
 func Handler() http.Handler {
+	return HandlerWithProvider(nil)
+}
+
+// HandlerWithProvider returns the HTTP surface with provider injected as the
+// executor for POST /v1/apply. Passing a nil Provider keeps the read-only
+// surface fully usable while apply reports provider_unavailable for non-empty
+// plans. The service never persists changes itself; provider is the only
+// component that executes them.
+func HandlerWithProvider(provider Provider) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/configurations/validate", handleValidateConfiguration)
 	mux.HandleFunc("/v1/configurations/order", handleOrderConfiguration)
 	mux.HandleFunc("/v1/plans", handlePlan)
+	mux.HandleFunc("/v1/apply", handleApply(provider))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
