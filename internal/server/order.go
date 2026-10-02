@@ -63,11 +63,26 @@ func orderConfiguration(doc any) ([]string, []validationError) {
 	resourceEntries := root["resources"].([]any)
 
 	addresses := make([]string, len(resourceEntries))
-	known := make(map[string]bool, len(resourceEntries))
-	dependsOn := make([][]string, len(resourceEntries))
 	for i, entry := range resourceEntries {
-		address := entry.(map[string]any)["address"].(string)
-		addresses[i] = address
+		addresses[i] = entry.(map[string]any)["address"].(string)
+	}
+
+	_, order, errs := resolveDependencies(resourceEntries, addresses, "/resources")
+	if len(errs) != 0 {
+		return nil, errs
+	}
+	return order, nil
+}
+
+// resolveDependencies interprets the dependsOn fields of resource entries
+// whose addresses are already known to be non-empty and unique. resourcesPath
+// is the JSON Pointer of the entries array, used as the base of error paths.
+// It returns the per-entry dependency lists together with a deterministic
+// topological order, or every dependency problem found; dependency problems
+// take precedence over cycle detection, and cycles over ordering.
+func resolveDependencies(entries []any, addresses []string, resourcesPath string) ([][]string, []string, []validationError) {
+	known := make(map[string]bool, len(addresses))
+	for _, address := range addresses {
 		known[address] = true
 	}
 
@@ -75,13 +90,14 @@ func orderConfiguration(doc any) ([]string, []validationError) {
 	add := func(code, message, path string) {
 		errs = append(errs, validationError{Code: code, Message: message, Path: path})
 	}
-	for i, entry := range resourceEntries {
+	dependsOn := make([][]string, len(entries))
+	for i, entry := range entries {
 		obj := entry.(map[string]any)
 		raw, present := obj["dependsOn"]
 		if !present {
 			continue
 		}
-		fieldPath := fmt.Sprintf("/resources/%d/dependsOn", i)
+		fieldPath := fmt.Sprintf("%s/%d/dependsOn", resourcesPath, i)
 		arr, ok := raw.([]any)
 		if !ok {
 			add(codeInvalidDocument, `"dependsOn" must be an array of non-empty resource address strings`, fieldPath)
@@ -111,7 +127,7 @@ func orderConfiguration(doc any) ([]string, []validationError) {
 		}
 	}
 	if len(errs) != 0 {
-		return nil, errs
+		return nil, nil, errs
 	}
 
 	if cyclic := cyclicResources(addresses, dependsOn); cyclic != nil {
@@ -119,12 +135,12 @@ func orderConfiguration(doc any) ([]string, []validationError) {
 		errs = append(errs, validationError{
 			Code:    codeDependencyCycle,
 			Message: "dependency cycle: " + strings.Join(cyclic, ", "),
-			Path:    "/resources",
+			Path:    resourcesPath,
 		})
-		return nil, errs
+		return nil, nil, errs
 	}
 
-	return topologicalOrder(addresses, dependsOn), nil
+	return dependsOn, topologicalOrder(addresses, dependsOn), nil
 }
 
 // topologicalOrder performs Kahn's algorithm, always selecting the available

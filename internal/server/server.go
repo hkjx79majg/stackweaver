@@ -23,6 +23,7 @@ func Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/configurations/validate", handleValidateConfiguration)
 	mux.HandleFunc("/v1/configurations/order", handleOrderConfiguration)
+	mux.HandleFunc("/v1/plans", handlePlan)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
