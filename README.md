@@ -38,7 +38,7 @@ type Provider interface {
 }
 ```
 
-`server.HandlerWithProvider(provider)` 注入执行器并返回完整 HTTP 表面；`server.Handler()` 等价于注入 `nil`。单项请求 `ChangeRequest` 携带请求的 `context.Context`、`action`、`address`、`before` 与 `after`。服务按顺序逐项调用 Provider（noop 不调用）：全部成功返回 200 及 `applied`、计划 `summary` 和由 `priorState` 演进而来的 `state`；某项失败时立即停止、不回滚，返回 502、`provider_error`（path 为 `/changes/{索引}`）及已成功的部分；有变更但未注入 Provider 时返回 503 `provider_unavailable`，空计划在无 Provider 时仍成功。
+`server.HandlerWithProvider(provider)` 注入执行器并返回完整 HTTP 表面；`server.Handler()` 等价于注入 `nil`。单项请求 `ChangeRequest` 携带请求的 `context.Context`、`action`、`address`、`before` 与 `after`，以及幂等标识 `idempotencyKey` 与尝试序号 `attempt`（初次调用为 1）。一次顶层请求内，每个非 noop 变更获得非空且互不相同的 `idempotencyKey`，同一变更的各次尝试复用该值，新的顶层请求不复用旧值；不需要去重的 Provider 可忽略这两个字段。服务按顺序逐项调用 Provider（noop 不调用）：全部成功返回 200 及 `applied`、计划 `summary` 和由 `priorState` 演进而来的 `state`；某项失败时立即停止、不回滚，返回 502、`provider_error`（path 为 `/changes/{索引}`）及已成功的部分；有变更但未注入 Provider 时返回 503 `provider_unavailable`，空计划在无 Provider 时仍成功。
 
 ## 状态文件
 
@@ -70,6 +70,21 @@ type Observer interface {
 合法请求在同一把状态锁内读取确定版本，随后按地址 Unicode 升序逐一 `Observe` 已保存资源（空状态不调用 Observer），沿用漂移检测的快照校验、规范化与等价比较：远端缺失记为 `create`，远端存在但不同记为 `update`，一致记为 `noop`；`delete` 恒为 0。`update` 的 `before` 为观察快照、`after` 为保存快照；`create` 省略 `before`、`after` 为保存快照。全部观察成功后，按保存状态的确定拓扑顺序调用 `Apply`，使被依赖资源先执行；`noop` 不调用 `Apply`。
 
 观察报错或结果非法时立即停止，分别返回 502 `observer_error` / `observer_invalid_result`，path 为 `/resources/{观察序号}`，且不执行任何变更。全部执行成功返回 200，携带按执行顺序排列的 `applied`、含 `create`/`update`/`delete`/`noop` 的完整 `summary`、原 `state` 与 `revision`。Provider 失败时立即停止且不回滚，返回 502 `provider_error`，path 为 `/changes/{执行序号}`，响应保留已成功的 `applied` 和完整 `summary`。任何结果都不写状态文件、不增加版本；锁覆盖读取、观察与执行并在所有结局下释放。
+
+## 受控重试与幂等标识
+
+Provider 可通过公开接口声明失败可重试：
+
+```go
+type RetryableError interface {
+    error
+    Retryable() bool
+}
+```
+
+`POST /v1/apply`、`POST /v1/state/apply` 与 `POST /v1/state/reconcile`（含按资源类型分派的 Provider）对 `Apply` 返回的错误统一处理：普通错误或 `Retryable()` 为 false 时沿用现状，立即返回 502 `provider_error`；`Retryable()` 为 true 时就地重试当前变更，最多调用三次（`attempt` 依次为 1、2、3），期间不推进后续变更，也不并发处理同一变更。任一次成功后该变更只记入 `applied` 一次并按既有顺序继续；后续尝试变为不可重试错误时立即停止；三次均失败时使用最后一次错误文本和该变更的全局索引返回 `provider_error`。准备重试前若请求 context 已结束，不再调用 Provider，并以 `context.Err()` 的文本返回相同的 502 `provider_error`。
+
+重试期间状态锁继续持有；成功重试的状态与版本效果等同于一次成功调用，最终失败仍沿用立即停止、不回滚、部分 `applied`、部分 state、原子提交与 revision 递增语义。只读入口与 `Observer` 不重试；路由预检、空计划、版本冲突、观察失败与请求校验不触发 `Apply`，行为不变。
 
 ## 多 Provider 分派
 

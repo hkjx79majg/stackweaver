@@ -195,15 +195,9 @@ func (b *stateBackend) handleReconcile(source providerSource) http.HandlerFunc {
 				providers[i] = provider
 			}
 
+			keys := newIdempotencyKeys(len(changes))
 			for i, change := range changes {
-				req := ChangeRequest{
-					Context: r.Context(),
-					Action:  change.Action,
-					Address: change.Address,
-					Before:  change.Before,
-					After:   change.After,
-				}
-				if err := providers[i].Apply(req); err != nil {
+				if err := applyChange(r.Context(), providers[i], change, keys[i]); err != nil {
 					// Stop immediately without rolling back; successful
 					// changes and the full summary are still reported.
 					w.WriteHeader(http.StatusBadGateway)

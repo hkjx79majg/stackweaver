@@ -76,18 +76,12 @@ func handleApply(source providerSource) http.HandlerFunc {
 		// succeed; the service holds it for this request alone.
 		state := seedState(priorResources)
 		applied := []planChange{}
+		keys := newIdempotencyKeys(len(changes))
 
 		for i, change := range changes {
 			// computePlan only emits create/update/delete; noops are absent
 			// from the list, so a Provider is never invoked for them.
-			req := ChangeRequest{
-				Context: r.Context(),
-				Action:  change.Action,
-				Address: change.Address,
-				Before:  change.Before,
-				After:   change.After,
-			}
-			if err := providers[i].Apply(req); err != nil {
+			if err := applyChange(r.Context(), providers[i], change, keys[i]); err != nil {
 				// Stop immediately: later changes are skipped, earlier ones
 				// are not rolled back.
 				w.WriteHeader(http.StatusBadGateway)

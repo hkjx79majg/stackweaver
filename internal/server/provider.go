@@ -21,6 +21,15 @@ type ChangeRequest struct {
 	Address string          `json:"address"`
 	Before  *Snapshot       `json:"before,omitempty"`
 	After   *Snapshot       `json:"after,omitempty"`
+	// IdempotencyKey identifies the planned change this request belongs to.
+	// Within one top-level request every non-noop change gets a non-empty
+	// key distinct from every other change's; all attempts of the same
+	// change reuse it, and a later top-level request never reuses earlier
+	// values. Providers that do not deduplicate executions may ignore it.
+	IdempotencyKey string `json:"idempotencyKey"`
+	// Attempt is the 1-based number of this execution attempt: 1 for the
+	// first call of a change, incremented on every retry.
+	Attempt int `json:"attempt"`
 }
 
 // Provider executes single planned changes. An implementation applies exactly
@@ -28,8 +37,22 @@ type ChangeRequest struct {
 // server performs no persistence of its own and never rolls changes back.
 type Provider interface {
 	// Apply executes one planned change. A non-nil error stops the apply
-	// run immediately; its text is reported verbatim to the caller.
+	// run immediately and its text is reported verbatim to the caller,
+	// unless it is a RetryableError reporting Retryable() true: then the
+	// server retries the same change in place, at most three attempts in
+	// total, reusing the IdempotencyKey and incrementing Attempt.
 	Apply(req ChangeRequest) error
+}
+
+// RetryableError is an error a Provider may return from Apply to mark a
+// failure as transient. The server retries the same change (same
+// IdempotencyKey, next Attempt) while Retryable reports true, up to three
+// attempts in total; a false value behaves exactly like a plain error and
+// stops the run immediately.
+type RetryableError interface {
+	error
+	// Retryable reports whether the failure is worth retrying.
+	Retryable() bool
 }
 
 // Observer is an optional capability a Provider may additionally implement to

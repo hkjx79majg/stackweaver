@@ -368,17 +368,11 @@ func (b *stateBackend) handleApply(source providerSource) http.HandlerFunc {
 		}
 
 		applied := []planChange{}
+		keys := newIdempotencyKeys(len(changes))
 		var providerErr error
 		var failIndex int
 		for i, change := range changes {
-			req := ChangeRequest{
-				Context: r.Context(),
-				Action:  change.Action,
-				Address: change.Address,
-				Before:  change.Before,
-				After:   change.After,
-			}
-			if err := providers[i].Apply(req); err != nil {
+			if err := applyChange(r.Context(), providers[i], change, keys[i]); err != nil {
 				// Stop immediately: later changes are skipped, earlier ones
 				// are not rolled back.
 				providerErr = err
