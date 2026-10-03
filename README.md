@@ -49,6 +49,14 @@ type Observer interface {
 
 该端点不调用 `Apply`、不写状态、不增加版本。未配置状态文件返回 503 `state_unavailable`；Provider 未实现 `Observer` 时在加锁前返回 503 `observer_unavailable`；锁被占用返回 409 `state_locked`；状态文件无效返回 500 `state_read_error`。观察报错或快照违反契约（type 为空、properties 为 nil、依赖含空值或重复值、properties 无法编码为 JSON）时立即停止，分别返回 502 `observer_error` / `observer_invalid_result`，path 为 `/resources/{排序后索引}`，失败响应不含部分 drifts。
 
+## 状态收敛
+
+`POST /v1/state/reconcile` 在同一把非阻塞排他锁内把远端向**已保存状态**收敛：读取确定版本后，按地址 Unicode 升序逐一 `Observe`（空状态不调用 Observer），复用漂移检测的快照校验、规范化与等价比较。远端缺失生成 `create`，存在但不同生成 `update`，一致计为 `noop`；`update` 的 `before` 为观察快照（规范化后）、`after` 为保存快照，`create` 省略 `before`，`after` 均为保存快照。全部观察成功后，按保存状态的确定拓扑顺序调用 `Apply`，使被依赖资源先执行；`noop` 不调用 Provider，`delete` 恒为 0。
+
+请求体是仅含可选 `expectedRevision`（非负整数）的 JSON 对象：畸形或含多个 JSON 值返回 400 `invalid_json`；非对象、未知字段或非法版本返回 422 `invalid_reconcile_request`。未配置状态文件返回 503 `state_unavailable`；Provider 未实现 `Observer` 在加锁前返回 503 `observer_unavailable`；锁冲突返回 409 `state_locked`；状态不可读返回 500 `state_read_error`。`expectedRevision` 与当前版本不符时返回 409 `state_conflict` 及 `currentRevision`，且不调用 `Observe` 或 `Apply`。
+
+观察报错或结果非法时立即停止且不执行任何变更，分别返回 502 `observer_error` / `observer_invalid_result`，path 为 `/resources/{观察序号}`。Provider 失败立即停止且不回滚，返回 502 `provider_error`，path 为 `/changes/{执行序号}`，响应保留已成功的 `applied` 与完整 `summary`。全部成功返回 200，携带按执行顺序的 `applied`、`create`/`update`/`delete`/`noop` 汇总、原 `state` 与 `revision`。任何结果都不写状态文件、不增加版本；锁覆盖读取、观察、执行并始终释放。非 POST 返回 405 且 `Allow: POST`。
+
 ## 验证
 
 ```bash

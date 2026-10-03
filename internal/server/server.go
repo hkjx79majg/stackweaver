@@ -42,8 +42,12 @@ func HandlerWithProvider(provider Provider) http.Handler {
 // state atomically under a non-blocking exclusive lock. When provider also
 // implements Observer, GET /v1/state/drift compares the stored state against
 // the observed remote snapshots without changing anything; without an
-// Observer that endpoint reports observer_unavailable. The request/response
-// behavior of every other endpoint is identical to HandlerWithProvider.
+// Observer that endpoint reports observer_unavailable. POST
+// /v1/state/reconcile additionally converges the remote toward the stored
+// state through Observer plus Apply without writing the state file or bumping
+// the revision; without an Observer it reports observer_unavailable. The
+// request/response behavior of every other endpoint is identical to
+// HandlerWithProvider.
 func HandlerWithProviderAndStateFile(provider Provider, path string) http.Handler {
 	return newMux(provider, newStateBackend(path))
 }
@@ -58,10 +62,12 @@ func newMux(provider Provider, backend *stateBackend) http.Handler {
 		mux.HandleFunc("/v1/state", backend.handleRead)
 		mux.HandleFunc("/v1/state/apply", backend.handleApply(provider))
 		mux.HandleFunc("/v1/state/drift", backend.handleDrift(observerOf(provider)))
+		mux.HandleFunc("/v1/state/reconcile", backend.handleReconcile(observerOf(provider), provider))
 	} else {
 		mux.HandleFunc("/v1/state", handleStateUnavailable)
 		mux.HandleFunc("/v1/state/apply", handleStateUnavailable)
 		mux.HandleFunc("/v1/state/drift", handleStateUnavailable)
+		mux.HandleFunc("/v1/state/reconcile", handleStateUnavailable)
 	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
