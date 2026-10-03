@@ -54,10 +54,10 @@ func observerOf(provider Provider) Observer {
 }
 
 // handleDrift serves GET /v1/state/drift: it compares the stored state
-// against the remote snapshots reported by observer, address by address in
-// ascending Unicode order. The run is strictly read-only: it never calls
-// Apply, never writes the state file, and never bumps the revision.
-func (b *stateBackend) handleDrift(observer Observer) http.HandlerFunc {
+// against the remote snapshots reported by the resolved Observers, address by
+// address in ascending Unicode order. The run is strictly read-only: it never
+// calls Apply, never writes the state file, and never bumps the revision.
+func (b *stateBackend) handleDrift(source providerSource) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		if r.Method != http.MethodGet {
@@ -69,13 +69,9 @@ func (b *stateBackend) handleDrift(observer Observer) http.HandlerFunc {
 			return
 		}
 
-		// The Observer capability is required before any locking or I/O.
-		if observer == nil {
-			writeValidation(w, http.StatusServiceUnavailable, []validationError{{
-				Code:    codeObserverUnavailable,
-				Message: "drift detection requires the provider to implement Observer",
-				Path:    "",
-			}})
+		// The Observer capability check the mode runs before any locking or
+		// I/O.
+		if !source.checkObserverPreLock(w, "drift detection requires the provider to implement Observer") {
 			return
 		}
 
@@ -103,16 +99,29 @@ func (b *stateBackend) handleDrift(observer Observer) http.HandlerFunc {
 		}
 
 		// Observe in ascending address order; that order indexes errors and
-		// sorts the resulting drifts. An empty state never reaches the
+		// sorts the resulting drifts. An empty state never reaches an
 		// Observer.
 		resources := make([]planResource, len(current.resources))
 		copy(resources, current.resources)
 		sort.Slice(resources, func(i, j int) bool { return resources[i].address < resources[j].address })
 
+		// Precheck: every resource must route to a Provider implementing
+		// Observer before anything is observed. Any failure aborts the run
+		// without calling Observe or writing state.
+		observers := make([]Observer, len(resources))
+		for i, resource := range resources {
+			observer, precheckErr := source.observerFor(resource, i)
+			if precheckErr != nil {
+				writeValidation(w, http.StatusServiceUnavailable, []validationError{*precheckErr})
+				return
+			}
+			observers[i] = observer
+		}
+
 		drifts := []driftEntry{}
 		var summary driftSummary
 		for i, resource := range resources {
-			observed, observeErr := observer.Observe(r.Context(), resource.address)
+			observed, observeErr := observers[i].Observe(r.Context(), resource.address)
 			if observeErr != nil {
 				// Stop immediately: later resources are not observed and no
 				// partial drift list is reported.

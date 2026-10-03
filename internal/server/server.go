@@ -33,7 +33,7 @@ func Handler() http.Handler {
 // component that executes them. Without a state file the state endpoints
 // report state_unavailable.
 func HandlerWithProvider(provider Provider) http.Handler {
-	return newMux(provider, nil)
+	return newMux(singleSource{provider: provider}, nil)
 }
 
 // HandlerWithProviderAndStateFile returns the full HTTP surface backed by the
@@ -47,20 +47,50 @@ func HandlerWithProvider(provider Provider) http.Handler {
 // endpoints report observer_unavailable. The request/response behavior of
 // every other endpoint is identical to HandlerWithProvider.
 func HandlerWithProviderAndStateFile(provider Provider, path string) http.Handler {
-	return newMux(provider, newStateBackend(path))
+	return newMux(singleSource{provider: provider}, newStateBackend(path))
 }
 
-func newMux(provider Provider, backend *stateBackend) http.Handler {
+// HandlerWithProviders returns the HTTP surface dispatching each planned
+// change to the Provider registered for its resource type: creates and
+// updates route by the after snapshot's type (a type-changing update goes to
+// the target type's Provider), deletes by the before snapshot's type. Map
+// entries with an empty type key or a nil Provider count as unregistered, and
+// one instance may serve several types. Before anything executes, every
+// non-noop change is prechecked; a change whose type has no registered
+// Provider fails the whole run with 503 provider_unavailable indexed into the
+// plan, without calling any Provider. An empty plan succeeds with an empty
+// registry. Every other endpoint behaves exactly like HandlerWithProvider.
+func HandlerWithProviders(providers map[string]Provider) http.Handler {
+	return newMux(newMultiSource(providers), nil)
+}
+
+// HandlerWithProvidersAndStateFile combines the type-dispatching registry of
+// HandlerWithProviders with the state-file backend of
+// HandlerWithProviderAndStateFile. GET /v1/state/drift and
+// POST /v1/state/reconcile resolve each saved resource's Provider by its
+// stored type and require that instance to implement Observer: under the
+// state lock, after the revision is read, all resources are prechecked in
+// ascending address order — a type without a registered Provider fails with
+// 503 provider_unavailable and one whose Provider is no Observer fails with
+// 503 observer_unavailable, both indexed into the address-sorted resource
+// list and neither calling Observe or Apply nor writing state. Resources are
+// never regrouped by Provider; observation, comparison, and execution keep
+// the single-Provider orders and response shapes.
+func HandlerWithProvidersAndStateFile(providers map[string]Provider, path string) http.Handler {
+	return newMux(newMultiSource(providers), newStateBackend(path))
+}
+
+func newMux(source providerSource, backend *stateBackend) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/configurations/validate", handleValidateConfiguration)
 	mux.HandleFunc("/v1/configurations/order", handleOrderConfiguration)
 	mux.HandleFunc("/v1/plans", handlePlan)
-	mux.HandleFunc("/v1/apply", handleApply(provider))
+	mux.HandleFunc("/v1/apply", handleApply(source))
 	if backend != nil {
 		mux.HandleFunc("/v1/state", backend.handleRead)
-		mux.HandleFunc("/v1/state/apply", backend.handleApply(provider))
-		mux.HandleFunc("/v1/state/drift", backend.handleDrift(observerOf(provider)))
-		mux.HandleFunc("/v1/state/reconcile", backend.handleReconcile(provider, observerOf(provider)))
+		mux.HandleFunc("/v1/state/apply", backend.handleApply(source))
+		mux.HandleFunc("/v1/state/drift", backend.handleDrift(source))
+		mux.HandleFunc("/v1/state/reconcile", backend.handleReconcile(source))
 	} else {
 		mux.HandleFunc("/v1/state", handleStateUnavailable)
 		mux.HandleFunc("/v1/state/apply", handleStateUnavailable)

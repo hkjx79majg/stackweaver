@@ -35,9 +35,10 @@ type applyResponse struct {
 }
 
 // handleApply validates and plans a request exactly like POST /v1/plans, then
-// hands the ordered non-noop changes to provider one at a time. It returns a
-// handler so the injected Provider is captured once at wiring time.
-func handleApply(provider Provider) http.HandlerFunc {
+// hands the ordered non-noop changes to the resolved Providers one at a time.
+// It returns a handler so the injected provider source is captured once at
+// wiring time.
+func handleApply(source providerSource) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		if r.Method != http.MethodPost {
@@ -52,18 +53,23 @@ func handleApply(provider Provider) http.HandlerFunc {
 			return
 		}
 
-		if len(changes) > 0 && provider == nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(applyResponse{
-				Valid: false,
-				Errors: []validationError{{
-					Code:    codeProviderUnavailable,
-					Message: "apply requires a provider, but none is configured",
-					Path:    "",
-				}},
-				Summary: summary,
-			})
-			return
+		// Precheck: every change must route to a registered Provider before
+		// anything executes. An unroutable change aborts the whole run
+		// without calling any Provider; an empty plan needs none.
+		providers := make([]Provider, len(changes))
+		for i, change := range changes {
+			typ := changeType(change)
+			provider, registered := source.providerFor(typ)
+			if !registered {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(applyResponse{
+					Valid:   false,
+					Errors:  []validationError{source.applyUnavailable(typ, i)},
+					Summary: summary,
+				})
+				return
+			}
+			providers[i] = provider
 		}
 
 		// State starts from priorState and is mutated only as changes
@@ -81,7 +87,7 @@ func handleApply(provider Provider) http.HandlerFunc {
 				Before:  change.Before,
 				After:   change.After,
 			}
-			if err := provider.Apply(req); err != nil {
+			if err := providers[i].Apply(req); err != nil {
 				// Stop immediately: later changes are skipped, earlier ones
 				// are not rolled back.
 				w.WriteHeader(http.StatusBadGateway)

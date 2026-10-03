@@ -252,7 +252,7 @@ type stateApplyResponse struct {
 // handleApply serves POST /v1/state/apply: it plans the submitted
 // configuration against the state file and executes under the file's
 // non-blocking exclusive lock, committing the evolved state atomically.
-func (b *stateBackend) handleApply(provider Provider) http.HandlerFunc {
+func (b *stateBackend) handleApply(source providerSource) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		if r.Method != http.MethodPost {
@@ -345,20 +345,26 @@ func (b *stateBackend) handleApply(provider Provider) http.HandlerFunc {
 			return
 		}
 
-		if provider == nil {
-			revision := current.revision
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(stateApplyResponse{
-				Valid: false,
-				Errors: []validationError{{
-					Code:    codeProviderUnavailable,
-					Message: "apply requires a provider, but none is configured",
-					Path:    "",
-				}},
-				Summary:  summary,
-				Revision: &revision,
-			})
-			return
+		// Precheck: every change must route to a registered Provider before
+		// anything executes. An unroutable change aborts the whole run
+		// without calling any Provider and leaves the file and its revision
+		// untouched.
+		providers := make([]Provider, len(changes))
+		for i, change := range changes {
+			typ := changeType(change)
+			provider, registered := source.providerFor(typ)
+			if !registered {
+				revision := current.revision
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(stateApplyResponse{
+					Valid:    false,
+					Errors:   []validationError{source.applyUnavailable(typ, i)},
+					Summary:  summary,
+					Revision: &revision,
+				})
+				return
+			}
+			providers[i] = provider
 		}
 
 		applied := []planChange{}
@@ -372,7 +378,7 @@ func (b *stateBackend) handleApply(provider Provider) http.HandlerFunc {
 				Before:  change.Before,
 				After:   change.After,
 			}
-			if err := provider.Apply(req); err != nil {
+			if err := providers[i].Apply(req); err != nil {
 				// Stop immediately: later changes are skipped, earlier ones
 				// are not rolled back.
 				providerErr = err

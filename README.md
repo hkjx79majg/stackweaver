@@ -71,6 +71,14 @@ type Observer interface {
 
 观察报错或结果非法时立即停止，分别返回 502 `observer_error` / `observer_invalid_result`，path 为 `/resources/{观察序号}`，且不执行任何变更。全部执行成功返回 200，携带按执行顺序排列的 `applied`、含 `create`/`update`/`delete`/`noop` 的完整 `summary`、原 `state` 与 `revision`。Provider 失败时立即停止且不回滚，返回 502 `provider_error`，path 为 `/changes/{执行序号}`，响应保留已成功的 `applied` 和完整 `summary`。任何结果都不写状态文件、不增加版本；锁覆盖读取、观察与执行并在所有结局下释放。
 
+## 多 Provider 分派
+
+`server.HandlerWithProviders(providers)` 与 `server.HandlerWithProvidersAndStateFile(providers, path)` 接收 `map[string]server.Provider`，按资源类型把变更分派给对应 Provider；空类型键或 nil 值视为未注册，同一实例可服务多个类型。构造入口、健康检查、校验、排序、计划与只读 CLI 与单 Provider 模式完全一致。
+
+`POST /v1/apply` 与 `POST /v1/state/apply` 仍产生全局确定顺序的变更流：create、update 按 `after.type` 路由（类型变化的 update 交给目标类型 Provider，并原样传递 `before`、`after` 与请求 context），delete 按 `before.type` 路由。校验及计划成功后先预检全部非 noop 变更；任一项类型未注册时返回 503 `provider_unavailable`，path 为 `/changes/{全局索引}`，不调用任何 Provider，也不改变状态文件或 revision。预检通过后按原顺序执行，Provider 失败仍返回 502 `provider_error`，沿用立即停止、部分 applied、部分 state、原子提交与版本递增语义。空计划无需注册表即可成功。
+
+`GET /v1/state/drift` 与 `POST /v1/state/reconcile` 按已保存资源的 `type` 选择实例，并要求该实例实现 `Observer`。持有状态锁并读得确定 revision 后，按地址升序预检全部资源：缺少路由返回 503 `provider_unavailable`，不支持 `Observer` 返回 503 `observer_unavailable`，path 均为 `/resources/{升序索引}`；任一预检失败都不调用 `Observe` 或 `Apply`，也不写状态。全部通过后沿用单 Provider 模式的观察校验、漂移比较、拓扑执行、错误停止与响应结构，不按 Provider 分组重排资源；锁在所有结果下释放，未配置状态文件的行为不变。
+
 ## 验证
 
 ```bash
