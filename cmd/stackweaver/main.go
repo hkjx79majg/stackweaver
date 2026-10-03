@@ -10,6 +10,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		os.Exit(runCLI(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	}
+
 	addr := os.Getenv("STACKWEAVER_ADDR")
 	if addr == "" {
 		addr = "127.0.0.1:8080"

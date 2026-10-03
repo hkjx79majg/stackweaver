@@ -12,6 +12,20 @@ go run ./cmd/stackweaver
 
 服务默认监听 `127.0.0.1:8080`。可通过 `STACKWEAVER_ADDR` 修改监听地址。`GET /healthz` 返回 JSON 健康状态。
 
+## 只读命令行
+
+不带参数运行 `stackweaver` 时按上述规则启动 HTTP 服务；带子命令时只执行本地只读流水线，不监听端口、不调用 Provider、不读取或写入状态文件，也不受 `STACKWEAVER_ADDR` 影响：
+
+```bash
+stackweaver validate            # 等价于 POST /v1/configurations/validate
+stackweaver order               # 等价于 POST /v1/configurations/order
+stackweaver plan                # 等价于 POST /v1/plans
+```
+
+三个子命令接收与对应 HTTP 入口完全相同的 JSON 文档：默认从标准输入读取，也可用 `--file PATH`（或 `--file=PATH`）读取一个 UTF-8 文件；两种来源都只允许恰好一个 JSON 值。成功时向标准输出写入一行 JSON 和换行，对象内容、错误排序、计划顺序、数值等价与依赖集合语义与对应 HTTP 入口逐字节一致，退出码为 0。请求为空、畸形、带尾随值或未通过既有业务校验时，把对应入口会返回的 `invalid_json` 或验证错误对象写到标准输出（不写标准错误），退出码为 2。
+
+未知子命令、位置参数、未知选项、重复的 `--file` 或缺少其值均为命令行参数错误：向标准错误输出单行 JSON（`error.code` 固定为 `invalid_cli_arguments`，`error.message` 非空），标准输出保持为空，退出码为 2。`--file` 指定的文件不存在、不可读或读取失败时向标准错误输出 `error.code` 固定为 `input_read_error` 的单行 JSON，退出码为 1，且不会退回读取标准输入。
+
 ## 执行计划
 
 `POST /v1/apply` 与 `POST /v1/plans` 使用相同的 `configuration` / `priorState` 信封、校验规则与确定性变更顺序；它不读取文件、环境变量或远端状态，也不在请求之间保存状态。
