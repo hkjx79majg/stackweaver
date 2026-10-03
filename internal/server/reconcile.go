@@ -195,17 +195,14 @@ func (b *stateBackend) handleReconcile(source providerSource) http.HandlerFunc {
 				providers[i] = provider
 			}
 
+			// One fresh idempotency key per executed change of this top-level
+			// request; retries reuse a change's key under the held state lock.
+			keys := mintIdempotencyKeys(len(changes))
 			for i, change := range changes {
-				req := ChangeRequest{
-					Context: r.Context(),
-					Action:  change.Action,
-					Address: change.Address,
-					Before:  change.Before,
-					After:   change.After,
-				}
-				if err := providers[i].Apply(req); err != nil {
-					// Stop immediately without rolling back; successful
-					// changes and the full summary are still reported.
+				// executeChange applies the controlled retry policy serially;
+				// on failure the run stops immediately without rolling back,
+				// and successful changes plus the full summary are reported.
+				if err := executeChange(r.Context(), providers[i], change, keys[i]); err != nil {
 					w.WriteHeader(http.StatusBadGateway)
 					_ = json.NewEncoder(w).Encode(reconcileResponse{
 						Valid:    false,

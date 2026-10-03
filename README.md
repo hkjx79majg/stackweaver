@@ -38,7 +38,22 @@ type Provider interface {
 }
 ```
 
-`server.HandlerWithProvider(provider)` 注入执行器并返回完整 HTTP 表面；`server.Handler()` 等价于注入 `nil`。单项请求 `ChangeRequest` 携带请求的 `context.Context`、`action`、`address`、`before` 与 `after`。服务按顺序逐项调用 Provider（noop 不调用）：全部成功返回 200 及 `applied`、计划 `summary` 和由 `priorState` 演进而来的 `state`；某项失败时立即停止、不回滚，返回 502、`provider_error`（path 为 `/changes/{索引}`）及已成功的部分；有变更但未注入 Provider 时返回 503 `provider_unavailable`，空计划在无 Provider 时仍成功。
+`server.HandlerWithProvider(provider)` 注入执行器并返回完整 HTTP 表面；`server.Handler()` 等价于注入 `nil`。单项请求 `ChangeRequest` 携带请求的 `context.Context`、`action`、`address`、`before` 与 `after`，并为每个非 noop 变更携带 `idempotencyKey`（字符串）与 1 起的 `attempt`（整数）：一次顶层请求内每个非 noop 变更获得非空且互不相同的 key，同一变更的各次尝试复用该 key，新的顶层请求不复用旧 key；忽略这两个新字段的既有 Provider 无需改造即可继续工作。服务按顺序逐项调用 Provider（noop 不调用）：全部成功返回 200 及 `applied`、计划 `summary` 和由 `priorState` 演进而来的 `state`；某项失败时立即停止、不回滚，返回 502、`provider_error`（path 为 `/changes/{索引}`）及已成功的部分；有变更但未注入 Provider 时返回 503 `provider_unavailable`，空计划在无 Provider 时仍成功。
+
+### 受控重试
+
+Provider 可让错误实现公开接口以声明可重试：
+
+```go
+type RetryableError interface {
+    error
+    Retryable() bool
+}
+```
+
+Apply 返回普通错误或 `Retryable()` 为 false 时沿用上述现状（立即停止，502 `provider_error`）；返回 `Retryable()` 为 true 时，服务串行重试**当前变更**，最多调用三次（`attempt` 依次为 1、2、3），期间不推进后续变更、不并发处理同一变更，且状态锁（若有）在重试期间继续持有。任一次成功后该变更只记入 `applied` 一次，再按既有顺序继续；后续尝试返回不可重试错误时立即停止（错误文本取该次尝试）；三次均失败时用最后一次错误文本与该变更的全局索引返回 `provider_error`。准备下一次重试前若请求 context 已结束，不再调用 Provider，而以 `context.Err()` 的文本返回同样的 502 错误。重试成功的状态与版本效果等同于一次成功调用；最终失败仍保持立即停止、不回滚、部分 applied、部分 state、原子提交与 revision 恰增一次的语义。路由预检、空计划、版本冲突、观察失败与请求校验均不会触发 Apply，因而也不会重试；只读入口（计划、校验、排序、状态读取、漂移检测）与 `Observer.Observe` 一律不重试。
+
+上述规则一致覆盖 `POST /v1/apply`、`POST /v1/state/apply` 与 `POST /v1/state/reconcile`，并同时适用于按资源类型分派的多 Provider 模式。
 
 ## 状态文件
 
@@ -47,7 +62,7 @@ type Provider interface {
 - `GET /v1/state` 返回状态文件的 `revision` 与 `state`（沿用既有 `resources` 结构）。文件不存在视为版本 0、资源为空；文件不可读或内容不合法返回 500 `state_read_error`，且不会改写文件。
 - `POST /v1/state/apply` 只接受 `configuration` 与可选 `expectedRevision` 信封（非法信封返回 422 `invalid_state_request`），以状态文件为 priorState 校验、计划并执行。整个执行从读取到提交持有规范化路径的非阻塞排他锁（分别创建的处理器同样互斥），锁被占用时返回 409 `state_locked`；`expectedRevision` 与当前版本不符返回 409 `state_conflict` 及 `currentRevision`，且不调用 Provider。
 
-空计划成功且版本不变；全部成功后原子替换文件，`revision` 恰增 1，响应携带 `applied`、`summary`、`state` 与 `revision`。Provider 失败仍返回 502 `provider_error` 并立即停止、不回滚：首项失败保持文件不变，已有成功项则保存部分 state 并增加一次版本。提交失败返回 500 `state_write_error`，不留半写文件，原文件保持完整可读，响应保留已执行项与待提交 state。未注入 Provider 而有变更时返回 503 `provider_unavailable`；未经状态文件创建的处理器访问这两个端点返回 503 `state_unavailable`。
+空计划成功且版本不变；全部成功后原子替换文件，`revision` 恰增 1，响应携带 `applied`、`summary`、`state` 与 `revision`。Provider 失败遵循上文「受控重试」：可重试错误在持有的状态锁下按 attempt 1/2/3 串行重试同一变更，重试成功只提交一次、版本只增一次；最终失败返回 502 `provider_error` 并立即停止、不回滚：首项失败保持文件不变，已有成功项则保存部分 state 并增加一次版本。提交失败返回 500 `state_write_error`，不留半写文件，原文件保持完整可读，响应保留已执行项与待提交 state。未注入 Provider 而有变更时返回 503 `provider_unavailable`；未经状态文件创建的处理器访问这两个端点返回 503 `state_unavailable`。
 
 ## 漂移检测
 
@@ -69,13 +84,13 @@ type Observer interface {
 
 合法请求在同一把状态锁内读取确定版本，随后按地址 Unicode 升序逐一 `Observe` 已保存资源（空状态不调用 Observer），沿用漂移检测的快照校验、规范化与等价比较：远端缺失记为 `create`，远端存在但不同记为 `update`，一致记为 `noop`；`delete` 恒为 0。`update` 的 `before` 为观察快照、`after` 为保存快照；`create` 省略 `before`、`after` 为保存快照。全部观察成功后，按保存状态的确定拓扑顺序调用 `Apply`，使被依赖资源先执行；`noop` 不调用 `Apply`。
 
-观察报错或结果非法时立即停止，分别返回 502 `observer_error` / `observer_invalid_result`，path 为 `/resources/{观察序号}`，且不执行任何变更。全部执行成功返回 200，携带按执行顺序排列的 `applied`、含 `create`/`update`/`delete`/`noop` 的完整 `summary`、原 `state` 与 `revision`。Provider 失败时立即停止且不回滚，返回 502 `provider_error`，path 为 `/changes/{执行序号}`，响应保留已成功的 `applied` 和完整 `summary`。任何结果都不写状态文件、不增加版本；锁覆盖读取、观察与执行并在所有结局下释放。
+观察报错或结果非法时立即停止，分别返回 502 `observer_error` / `observer_invalid_result`，path 为 `/resources/{观察序号}`，且不执行任何变更。全部执行成功返回 200，携带按执行顺序排列的 `applied`、含 `create`/`update`/`delete`/`noop` 的完整 `summary`、原 `state` 与 `revision`。Provider 的 Apply 失败遵循上文「受控重试」：`RetryableError` 按 attempt 1/2/3 串行重试同一变更（观察阶段与 `Observer.Observe` 不重试），最终失败时立即停止且不回滚，返回 502 `provider_error`，path 为 `/changes/{执行序号}`，响应保留已成功的 `applied` 和完整 `summary`。任何结果都不写状态文件、不增加版本；锁覆盖读取、观察与执行（含重试）并在所有结局下释放。
 
 ## 多 Provider 分派
 
 `server.HandlerWithProviders(providers)` 与 `server.HandlerWithProvidersAndStateFile(providers, path)` 接收 `map[string]server.Provider`，按资源类型把变更分派给对应 Provider；空类型键或 nil 值视为未注册，同一实例可服务多个类型。构造入口、健康检查、校验、排序、计划与只读 CLI 与单 Provider 模式完全一致。
 
-`POST /v1/apply` 与 `POST /v1/state/apply` 仍产生全局确定顺序的变更流：create、update 按 `after.type` 路由（类型变化的 update 交给目标类型 Provider，并原样传递 `before`、`after` 与请求 context），delete 按 `before.type` 路由。校验及计划成功后先预检全部非 noop 变更；任一项类型未注册时返回 503 `provider_unavailable`，path 为 `/changes/{全局索引}`，不调用任何 Provider，也不改变状态文件或 revision。预检通过后按原顺序执行，Provider 失败仍返回 502 `provider_error`，沿用立即停止、部分 applied、部分 state、原子提交与版本递增语义。空计划无需注册表即可成功。
+`POST /v1/apply` 与 `POST /v1/state/apply` 仍产生全局确定顺序的变更流：create、update 按 `after.type` 路由（类型变化的 update 交给目标类型 Provider，并原样传递 `before`、`after` 与请求 context），delete 按 `before.type` 路由。校验及计划成功后先预检全部非 noop 变更；任一项类型未注册时返回 503 `provider_unavailable`，path 为 `/changes/{全局索引}`，不调用任何 Provider，也不改变状态文件或 revision。预检通过后按原顺序执行，Provider 失败遵循「受控重试」：普通错误立即返回 502 `provider_error`，实现 `RetryableError` 且可重试的错误按 attempt 1/2/3 在同一类型的 Provider 上串行重试同一变更，最终失败沿用立即停止、部分 applied、部分 state、原子提交与版本递增语义。空计划无需注册表即可成功。
 
 `GET /v1/state/drift` 与 `POST /v1/state/reconcile` 按已保存资源的 `type` 选择实例，并要求该实例实现 `Observer`。持有状态锁并读得确定 revision 后，按地址升序预检全部资源：缺少路由返回 503 `provider_unavailable`，不支持 `Observer` 返回 503 `observer_unavailable`，path 均为 `/resources/{升序索引}`；任一预检失败都不调用 `Observe` 或 `Apply`，也不写状态。全部通过后沿用单 Provider 模式的观察校验、漂移比较、拓扑执行、错误停止与响应结构，不按 Provider 分组重排资源；锁在所有结果下释放，未配置状态文件的行为不变。
 

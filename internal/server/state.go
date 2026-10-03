@@ -370,17 +370,15 @@ func (b *stateBackend) handleApply(source providerSource) http.HandlerFunc {
 		applied := []planChange{}
 		var providerErr error
 		var failIndex int
+		// One fresh idempotency key per non-noop change of this top-level
+		// request; retries reuse a change's key under the held state lock.
+		keys := mintIdempotencyKeys(len(changes))
 		for i, change := range changes {
-			req := ChangeRequest{
-				Context: r.Context(),
-				Action:  change.Action,
-				Address: change.Address,
-				Before:  change.Before,
-				After:   change.After,
-			}
-			if err := providers[i].Apply(req); err != nil {
-				// Stop immediately: later changes are skipped, earlier ones
-				// are not rolled back.
+			// executeChange applies the controlled retry policy serially;
+			// the lock stays held across every attempt. On failure the run
+			// stops immediately: later changes are skipped, earlier ones are
+			// not rolled back.
+			if err := executeChange(r.Context(), providers[i], change, keys[i]); err != nil {
 				providerErr = err
 				failIndex = i
 				break

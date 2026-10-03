@@ -77,19 +77,19 @@ func handleApply(source providerSource) http.HandlerFunc {
 		state := seedState(priorResources)
 		applied := []planChange{}
 
+		// One fresh idempotency key per non-noop change of this top-level
+		// request; retries of a change reuse its key, and a later request
+		// mints a new set.
+		keys := mintIdempotencyKeys(len(changes))
+
 		for i, change := range changes {
 			// computePlan only emits create/update/delete; noops are absent
 			// from the list, so a Provider is never invoked for them.
-			req := ChangeRequest{
-				Context: r.Context(),
-				Action:  change.Action,
-				Address: change.Address,
-				Before:  change.Before,
-				After:   change.After,
-			}
-			if err := providers[i].Apply(req); err != nil {
+			if err := executeChange(r.Context(), providers[i], change, keys[i]); err != nil {
 				// Stop immediately: later changes are skipped, earlier ones
-				// are not rolled back.
+				// are not rolled back. A retryable error exhausted the
+				// attempt budget or turned non-retryable; either way the last
+				// error text is reported at the change's global index.
 				w.WriteHeader(http.StatusBadGateway)
 				_ = json.NewEncoder(w).Encode(applyResponse{
 					Valid:   false,
