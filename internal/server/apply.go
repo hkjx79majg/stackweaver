@@ -35,9 +35,9 @@ type applyResponse struct {
 }
 
 // handleApply validates and plans a request exactly like POST /v1/plans, then
-// hands the ordered non-noop changes to provider one at a time. It returns a
-// handler so the injected Provider is captured once at wiring time.
-func handleApply(provider Provider) http.HandlerFunc {
+// hands the ordered non-noop changes to the routed Providers one at a time.
+// It returns a handler so the router is captured once at wiring time.
+func handleApply(router providerRouter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		if r.Method != http.MethodPost {
@@ -52,7 +52,7 @@ func handleApply(provider Provider) http.HandlerFunc {
 			return
 		}
 
-		if len(changes) > 0 && provider == nil {
+		if len(changes) > 0 && !router.multi && router.single == nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(applyResponse{
 				Valid: false,
@@ -64,6 +64,25 @@ func handleApply(provider Provider) http.HandlerFunc {
 				Summary: summary,
 			})
 			return
+		}
+
+		if router.multi {
+			// Preflight every planned change before executing any: the first
+			// change whose type has no registered Provider fails the run and
+			// no Provider is called at all.
+			if index, typ, unrouted := router.unroutedChange(changes); unrouted {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(applyResponse{
+					Valid: false,
+					Errors: []validationError{{
+						Code:    codeProviderUnavailable,
+						Message: fmt.Sprintf("no provider registered for resource type %q", typ),
+						Path:    fmt.Sprintf("/changes/%d", index),
+					}},
+					Summary: summary,
+				})
+				return
+			}
 		}
 
 		// State starts from priorState and is mutated only as changes
@@ -81,7 +100,7 @@ func handleApply(provider Provider) http.HandlerFunc {
 				Before:  change.Before,
 				After:   change.After,
 			}
-			if err := provider.Apply(req); err != nil {
+			if err := router.forChange(change).Apply(req); err != nil {
 				// Stop immediately: later changes are skipped, earlier ones
 				// are not rolled back.
 				w.WriteHeader(http.StatusBadGateway)

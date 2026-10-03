@@ -252,7 +252,7 @@ type stateApplyResponse struct {
 // handleApply serves POST /v1/state/apply: it plans the submitted
 // configuration against the state file and executes under the file's
 // non-blocking exclusive lock, committing the evolved state atomically.
-func (b *stateBackend) handleApply(provider Provider) http.HandlerFunc {
+func (b *stateBackend) handleApply(router providerRouter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		if r.Method != http.MethodPost {
@@ -345,7 +345,7 @@ func (b *stateBackend) handleApply(provider Provider) http.HandlerFunc {
 			return
 		}
 
-		if provider == nil {
+		if !router.multi && router.single == nil {
 			revision := current.revision
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(stateApplyResponse{
@@ -361,6 +361,26 @@ func (b *stateBackend) handleApply(provider Provider) http.HandlerFunc {
 			return
 		}
 
+		if router.multi {
+			// Preflight every planned change before executing any: the first
+			// unrouted type fails the run with the file and revision untouched.
+			if index, typ, unrouted := router.unroutedChange(changes); unrouted {
+				revision := current.revision
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(stateApplyResponse{
+					Valid: false,
+					Errors: []validationError{{
+						Code:    codeProviderUnavailable,
+						Message: fmt.Sprintf("no provider registered for resource type %q", typ),
+						Path:    fmt.Sprintf("/changes/%d", index),
+					}},
+					Summary:  summary,
+					Revision: &revision,
+				})
+				return
+			}
+		}
+
 		applied := []planChange{}
 		var providerErr error
 		var failIndex int
@@ -372,7 +392,7 @@ func (b *stateBackend) handleApply(provider Provider) http.HandlerFunc {
 				Before:  change.Before,
 				After:   change.After,
 			}
-			if err := provider.Apply(req); err != nil {
+			if err := router.forChange(change).Apply(req); err != nil {
 				// Stop immediately: later changes are skipped, earlier ones
 				// are not rolled back.
 				providerErr = err

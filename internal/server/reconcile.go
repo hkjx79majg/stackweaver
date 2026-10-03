@@ -32,7 +32,7 @@ type reconcileResponse struct {
 // update, or noop against the saved snapshot, and then applies the changes in
 // the saved state's deterministic topological order. It never writes the
 // state file and never bumps the revision.
-func (b *stateBackend) handleReconcile(provider Provider, observer Observer) http.HandlerFunc {
+func (b *stateBackend) handleReconcile(router providerRouter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		if r.Method != http.MethodPost {
@@ -49,15 +49,19 @@ func (b *stateBackend) handleReconcile(provider Provider, observer Observer) htt
 			return
 		}
 
-		// The Observer capability is required before locking or I/O, exactly
-		// like drift detection.
-		if observer == nil {
-			writeValidation(w, http.StatusServiceUnavailable, []validationError{{
-				Code:    codeObserverUnavailable,
-				Message: "reconciliation requires the provider to implement Observer",
-				Path:    "",
-			}})
-			return
+		// In single-provider mode the Observer capability is required before
+		// locking or I/O, exactly like drift detection.
+		var singleObserver Observer
+		if !router.multi {
+			singleObserver = observerOf(router.single)
+			if singleObserver == nil {
+				writeValidation(w, http.StatusServiceUnavailable, []validationError{{
+					Code:    codeObserverUnavailable,
+					Message: "reconciliation requires the provider to implement Observer",
+					Path:    "",
+				}})
+				return
+			}
 		}
 
 		// One lock spans the read, every observation, and every Apply call;
@@ -105,10 +109,42 @@ func (b *stateBackend) handleReconcile(provider Provider, observer Observer) htt
 		copy(observed, current.resources)
 		sort.Slice(observed, func(i, j int) bool { return observed[i].address < observed[j].address })
 
+		observers := make([]Observer, len(observed))
+		if router.multi {
+			// Preflight every saved resource under the lock before observing
+			// or applying anything: an unregistered type or a missing
+			// Observer capability fails the run with no remote calls at all.
+			for i, resource := range observed {
+				provider := router.forType(resource.typ)
+				if provider == nil {
+					writeValidation(w, http.StatusServiceUnavailable, []validationError{{
+						Code:    codeProviderUnavailable,
+						Message: fmt.Sprintf("no provider registered for resource type %q", resource.typ),
+						Path:    fmt.Sprintf("/resources/%d", i),
+					}})
+					return
+				}
+				observer := observerOf(provider)
+				if observer == nil {
+					writeValidation(w, http.StatusServiceUnavailable, []validationError{{
+						Code:    codeObserverUnavailable,
+						Message: fmt.Sprintf("provider for resource type %q does not implement Observer", resource.typ),
+						Path:    fmt.Sprintf("/resources/%d", i),
+					}})
+					return
+				}
+				observers[i] = observer
+			}
+		} else {
+			for i := range observers {
+				observers[i] = singleObserver
+			}
+		}
+
 		changes := []planChange{}
 		var summary planSummary
 		for i, resource := range observed {
-			snapshot, observeErr := observer.Observe(r.Context(), resource.address)
+			snapshot, observeErr := observers[i].Observe(r.Context(), resource.address)
 			if observeErr != nil {
 				// Stop before any change is made: nothing has been applied yet.
 				writeValidation(w, http.StatusBadGateway, []validationError{{
@@ -161,11 +197,11 @@ func (b *stateBackend) handleReconcile(provider Provider, observer Observer) htt
 		// in that order (none expected from a validated file) sort last.
 		changes = orderReconcileChanges(changes, current.order)
 
-		// All noops: the Provider is never invoked and the run succeeds even
+		// All noops: no Provider is ever invoked and the run succeeds even
 		// when no Provider was injected.
 		applied := []planChange{}
 		if len(changes) > 0 {
-			if provider == nil {
+			if !router.multi && router.single == nil {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_ = json.NewEncoder(w).Encode(reconcileResponse{
 					Valid: false,
@@ -189,7 +225,7 @@ func (b *stateBackend) handleReconcile(provider Provider, observer Observer) htt
 					Before:  change.Before,
 					After:   change.After,
 				}
-				if err := provider.Apply(req); err != nil {
+				if err := router.forChange(change).Apply(req); err != nil {
 					// Stop immediately without rolling back; successful
 					// changes and the full summary are still reported.
 					w.WriteHeader(http.StatusBadGateway)

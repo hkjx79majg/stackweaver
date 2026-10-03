@@ -54,10 +54,10 @@ func observerOf(provider Provider) Observer {
 }
 
 // handleDrift serves GET /v1/state/drift: it compares the stored state
-// against the remote snapshots reported by observer, address by address in
-// ascending Unicode order. The run is strictly read-only: it never calls
-// Apply, never writes the state file, and never bumps the revision.
-func (b *stateBackend) handleDrift(observer Observer) http.HandlerFunc {
+// against the remote snapshots reported by the routed Observers, address by
+// address in ascending Unicode order. The run is strictly read-only: it never
+// calls Apply, never writes the state file, and never bumps the revision.
+func (b *stateBackend) handleDrift(router providerRouter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		if r.Method != http.MethodGet {
@@ -69,14 +69,19 @@ func (b *stateBackend) handleDrift(observer Observer) http.HandlerFunc {
 			return
 		}
 
-		// The Observer capability is required before any locking or I/O.
-		if observer == nil {
-			writeValidation(w, http.StatusServiceUnavailable, []validationError{{
-				Code:    codeObserverUnavailable,
-				Message: "drift detection requires the provider to implement Observer",
-				Path:    "",
-			}})
-			return
+		// In single-provider mode the Observer capability is required before
+		// any locking or I/O.
+		var singleObserver Observer
+		if !router.multi {
+			singleObserver = observerOf(router.single)
+			if singleObserver == nil {
+				writeValidation(w, http.StatusServiceUnavailable, []validationError{{
+					Code:    codeObserverUnavailable,
+					Message: "drift detection requires the provider to implement Observer",
+					Path:    "",
+				}})
+				return
+			}
 		}
 
 		// The same non-blocking exclusive lock guards apply runs and drift
@@ -103,16 +108,48 @@ func (b *stateBackend) handleDrift(observer Observer) http.HandlerFunc {
 		}
 
 		// Observe in ascending address order; that order indexes errors and
-		// sorts the resulting drifts. An empty state never reaches the
+		// sorts the resulting drifts. An empty state never reaches an
 		// Observer.
 		resources := make([]planResource, len(current.resources))
 		copy(resources, current.resources)
 		sort.Slice(resources, func(i, j int) bool { return resources[i].address < resources[j].address })
 
+		observers := make([]Observer, len(resources))
+		if router.multi {
+			// Preflight every saved resource under the lock before observing
+			// any: an unregistered type or a Provider without the Observer
+			// capability fails the run without a single Observe call.
+			for i, resource := range resources {
+				provider := router.forType(resource.typ)
+				if provider == nil {
+					writeValidation(w, http.StatusServiceUnavailable, []validationError{{
+						Code:    codeProviderUnavailable,
+						Message: fmt.Sprintf("no provider registered for resource type %q", resource.typ),
+						Path:    fmt.Sprintf("/resources/%d", i),
+					}})
+					return
+				}
+				observer := observerOf(provider)
+				if observer == nil {
+					writeValidation(w, http.StatusServiceUnavailable, []validationError{{
+						Code:    codeObserverUnavailable,
+						Message: fmt.Sprintf("provider for resource type %q does not implement Observer", resource.typ),
+						Path:    fmt.Sprintf("/resources/%d", i),
+					}})
+					return
+				}
+				observers[i] = observer
+			}
+		} else {
+			for i := range observers {
+				observers[i] = singleObserver
+			}
+		}
+
 		drifts := []driftEntry{}
 		var summary driftSummary
 		for i, resource := range resources {
-			observed, observeErr := observer.Observe(r.Context(), resource.address)
+			observed, observeErr := observers[i].Observe(r.Context(), resource.address)
 			if observeErr != nil {
 				// Stop immediately: later resources are not observed and no
 				// partial drift list is reported.
