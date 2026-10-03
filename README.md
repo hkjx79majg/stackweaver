@@ -35,6 +35,20 @@ type Provider interface {
 
 空计划成功且版本不变；全部成功后原子替换文件，`revision` 恰增 1，响应携带 `applied`、`summary`、`state` 与 `revision`。Provider 失败仍返回 502 `provider_error` 并立即停止、不回滚：首项失败保持文件不变，已有成功项则保存部分 state 并增加一次版本。提交失败返回 500 `state_write_error`，不留半写文件，原文件保持完整可读，响应保留已执行项与待提交 state。未注入 Provider 而有变更时返回 503 `provider_unavailable`；未经状态文件创建的处理器访问这两个端点返回 503 `state_unavailable`。
 
+## 漂移检测
+
+Provider 可同时实现可选的 `server.Observer` 接口，开放只读漂移检测：
+
+```go
+type Observer interface {
+    Observe(ctx context.Context, address string) (*Snapshot, error)
+}
+```
+
+`GET /v1/state/drift` 在与 apply 相同的非阻塞排他锁下读取状态文件的确定版本，随后按地址 Unicode 升序逐一调用 `Observe`（请求上下文原样传入；空状态不调用 Observer），比较存储快照与远端快照。比较沿用计划语义：对象键序与等值数字写法不影响结果，数组保序，依赖按集合比较且输出升序。成功返回 200，携带 `revision`、按地址排序的 `drifts`（`changed` 条目含 `before` 与 `observed`，远端不存在记为 `missing` 并省略 `observed`，一致资源不出现）以及含 `unchanged`/`changed`/`missing` 计数的 `summary`。
+
+该端点不调用 `Apply`、不写状态、不增加版本。未配置状态文件返回 503 `state_unavailable`；Provider 未实现 `Observer` 时在加锁前返回 503 `observer_unavailable`；锁被占用返回 409 `state_locked`；状态文件无效返回 500 `state_read_error`。观察报错或快照违反契约（type 为空、properties 为 nil、依赖含空值或重复值、properties 无法编码为 JSON）时立即停止，分别返回 502 `observer_error` / `observer_invalid_result`，path 为 `/resources/{排序后索引}`，失败响应不含部分 drifts。
+
 ## 验证
 
 ```bash

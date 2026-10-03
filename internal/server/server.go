@@ -39,7 +39,10 @@ func HandlerWithProvider(provider Provider) http.Handler {
 // HandlerWithProviderAndStateFile returns the full HTTP surface backed by the
 // state file at path: GET /v1/state reports the stored revision and state,
 // and POST /v1/state/apply plans against the file and commits the evolved
-// state atomically under a non-blocking exclusive lock. The request/response
+// state atomically under a non-blocking exclusive lock. When provider also
+// implements Observer, GET /v1/state/drift compares the stored state against
+// the observed remote snapshots without changing anything; without an
+// Observer that endpoint reports observer_unavailable. The request/response
 // behavior of every other endpoint is identical to HandlerWithProvider.
 func HandlerWithProviderAndStateFile(provider Provider, path string) http.Handler {
 	return newMux(provider, newStateBackend(path))
@@ -54,9 +57,11 @@ func newMux(provider Provider, backend *stateBackend) http.Handler {
 	if backend != nil {
 		mux.HandleFunc("/v1/state", backend.handleRead)
 		mux.HandleFunc("/v1/state/apply", backend.handleApply(provider))
+		mux.HandleFunc("/v1/state/drift", backend.handleDrift(observerOf(provider)))
 	} else {
 		mux.HandleFunc("/v1/state", handleStateUnavailable)
 		mux.HandleFunc("/v1/state/apply", handleStateUnavailable)
+		mux.HandleFunc("/v1/state/drift", handleStateUnavailable)
 	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
