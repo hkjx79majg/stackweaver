@@ -31,3 +31,15 @@ type Provider interface {
 	// run immediately; its text is reported verbatim to the caller.
 	Apply(req ChangeRequest) error
 }
+
+// Observer is an optional Provider capability: a Provider that also
+// implements Observer lets GET /v1/state/drift compare the managed resources
+// recorded in the state file against the live cloud snapshot. Observation is
+// read-only; it never mutates the remote side or the state file.
+type Observer interface {
+	// Observe fetches the current remote view of one managed resource. The
+	// context is the inbound request context and must not be retained past
+	// the call. A nil Snapshot with a nil error means the resource does not
+	// exist remotely; a non-nil error stops the drift run immediately.
+	Observe(ctx context.Context, address string) (*Snapshot, error)
+}
