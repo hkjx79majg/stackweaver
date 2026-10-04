@@ -94,17 +94,23 @@ func preparePlan(w http.ResponseWriter, r *http.Request) (changes []planChange, 
 
 	// Configuration and prior state are validated independently; their
 	// findings are merged and sorted together. Configuration findings keep
-	// their codes and gain a /configuration path prefix.
+	// their codes and gain a /configuration path prefix. A valid
+	// configuration is resolved — variable references replaced by their
+	// effective values — before ordering and diffing, so plans, snapshots,
+	// and state only ever see resolved properties.
 	var errs []validationError
 	var configResources []planResource
 	var configOrder []string
 	if baseErrs := validateConfiguration(configRaw); len(baseErrs) != 0 {
 		errs = appendPrefixedErrors(errs, baseErrs, "/configuration")
-	} else if order, depErrs := orderConfiguration(configRaw); len(depErrs) != 0 {
-		errs = appendPrefixedErrors(errs, depErrs, "/configuration")
 	} else {
-		configResources = configurationResources(configRaw)
-		configOrder = order
+		resolved := resolveConfigurationVariables(configRaw)
+		if order, depErrs := orderConfiguration(resolved); len(depErrs) != 0 {
+			errs = appendPrefixedErrors(errs, depErrs, "/configuration")
+		} else {
+			configResources = configurationResources(resolved)
+			configOrder = order
+		}
 	}
 
 	stateResources, stateOrder, stateErrs := checkPriorState(stateRaw)

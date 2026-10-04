@@ -131,9 +131,23 @@ func validateConfiguration(doc any) []validationError {
 		return errs
 	}
 	for key := range root {
-		if key != "resourceTypes" && key != "resources" {
+		if key != "resourceTypes" && key != "resources" && key != "variables" && key != "variableValues" {
 			add(codeInvalidDocument, fmt.Sprintf("unknown field %q", key), "/"+pointerEscape(key))
 		}
+	}
+
+	// The variable sections are validated and resolved before any property
+	// is checked against its schema: a document whose variables cannot be
+	// resolved has no meaningful resolved properties to validate. Documents
+	// without the variable fields skip the whole phase unchanged.
+	varsActive := variablesActivated(root)
+	var varEnv *variableEnv
+	varsOK := false
+	if varsActive {
+		env, varErrs := analyzeVariables(root)
+		errs = append(errs, varErrs...)
+		varEnv = env
+		varsOK = len(varErrs) == 0
 	}
 
 	typesRaw, hasTypes := root["resourceTypes"]
@@ -202,6 +216,11 @@ func validateConfiguration(doc any) []validationError {
 	}
 
 	seenAddresses := map[string]bool{}
+	// Property validation is deferred until every entry has been read: when
+	// the variable feature is active, references are resolved first and the
+	// resolved properties are what the schemas are checked against.
+	propsByIndex := map[int]map[string]any{}
+	schemaByIndex := map[int]any{}
 	for i, entry := range resourceEntries {
 		entryPath := fmt.Sprintf("/resources/%d", i)
 		obj, ok := entry.(map[string]any)
@@ -246,12 +265,52 @@ func validateConfiguration(doc any) []validationError {
 			add(codeInvalidDocument, `"properties" must be an object`, entryPath+"/properties")
 			continue
 		}
+		propsByIndex[i] = props
 		if schemaUsable {
-			validateValue(props, schema, entryPath+"/properties", add)
+			schemaByIndex[i] = schema
+		}
+	}
+
+	if varsActive {
+		if varsOK {
+			// Resolve every reference before any schema check; a single
+			// broken reference leaves the document unresolvable, so property
+			// validation is skipped entirely.
+			resolved := map[int]map[string]any{}
+			refsOK := true
+			for _, i := range sortedIndices(propsByIndex) {
+				propsPath := fmt.Sprintf("/resources/%d/properties", i)
+				out, ok := resolveVariableReferences(propsByIndex[i], varEnv, propsPath, add)
+				if !ok {
+					refsOK = false
+					continue
+				}
+				resolved[i] = out.(map[string]any)
+			}
+			if refsOK {
+				for _, i := range sortedIndices(schemaByIndex) {
+					validateValue(resolved[i], schemaByIndex[i], fmt.Sprintf("/resources/%d/properties", i), add)
+				}
+			}
+		}
+	} else {
+		for _, i := range sortedIndices(schemaByIndex) {
+			validateValue(propsByIndex[i], schemaByIndex[i], fmt.Sprintf("/resources/%d/properties", i), add)
 		}
 	}
 
 	return errs
+}
+
+// sortedIndices returns the keys of an index-keyed map in ascending order so
+// validation findings are discovered deterministically.
+func sortedIndices[V any](m map[int]V) []int {
+	indices := make([]int, 0, len(m))
+	for i := range m {
+		indices = append(indices, i)
+	}
+	sort.Ints(indices)
+	return indices
 }
 
 // identifierField extracts a required non-empty string field, reporting

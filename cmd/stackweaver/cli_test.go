@@ -357,3 +357,66 @@ func assertSingleJSONValue(t *testing.T, text string) {
 		t.Fatalf("output missing trailing newline: %q", text)
 	}
 }
+
+func TestCLIVariablesMatchHTTP(t *testing.T) {
+	// A configuration exercising the variable feature: declarations, an
+	// explicit value, and references at depth.
+	body := `{
+	  "resourceTypes": [{"name": "t", "schema": {"type": "object", "additionalProperties": true}}],
+	  "variables": {"size": {"schema": {"type": "integer"}, "default": 2}, "label": {"schema": {"type": "string"}}},
+	  "variableValues": {"label": "web"},
+	  "resources": [{"address": "a", "type": "t", "properties": {"cpu": {"$variable": "size"}, "name": {"$variable": "label"}}}]
+	}`
+	for _, command := range []string{"validate", "order"} {
+		status, expected := httpBody(t, command, body)
+		if status != http.StatusOK {
+			t.Fatalf("fixture: %s status = %d, want 200", command, status)
+		}
+		res := runCLIWith(t, []string{command}, body)
+		if res.code != 0 || res.stdout != expected || res.stderr != "" {
+			t.Fatalf("%s: code=%d stdout=%q want %q stderr=%q", command, res.code, res.stdout, expected, res.stderr)
+		}
+	}
+
+	// A variable error surfaces identically through the CLI and HTTP.
+	broken := `{
+	  "resourceTypes": [{"name": "t", "schema": {"type": "object", "additionalProperties": true}}],
+	  "variables": {"size": {"schema": {"type": "integer"}}},
+	  "resources": [{"address": "a", "type": "t", "properties": {"cpu": {"$variable": "size"}}}]
+	}`
+	for _, command := range []string{"validate", "order"} {
+		status, expected := httpBody(t, command, broken)
+		if status != http.StatusUnprocessableEntity {
+			t.Fatalf("fixture: %s status = %d, want 422", command, status)
+		}
+		res := runCLIWith(t, []string{command}, broken)
+		if res.code != 2 || res.stdout != expected || res.stderr != "" {
+			t.Fatalf("%s: code=%d stdout=%q want %q stderr=%q", command, res.code, res.stdout, expected, res.stderr)
+		}
+		if !strings.Contains(res.stdout, "missing_variable_value") {
+			t.Fatalf("%s: expected missing_variable_value in %q", command, res.stdout)
+		}
+	}
+
+	// Plan resolves references before diffing: the after snapshot carries
+	// the resolved value and the CLI output matches the HTTP entry point.
+	plan := `{
+	  "configuration": {
+	    "resourceTypes": [{"name": "t", "schema": {"type": "object", "additionalProperties": true}}],
+	    "variables": {"size": {"schema": {"type": "integer"}, "default": 2}},
+	    "resources": [{"address": "a", "type": "t", "properties": {"cpu": {"$variable": "size"}}}]
+	  },
+	  "priorState": {"resources": []}
+	}`
+	status, expected := httpBody(t, "plan", plan)
+	if status != http.StatusOK {
+		t.Fatalf("fixture plan status = %d, want 200", status)
+	}
+	res := runCLIWith(t, []string{"plan"}, plan)
+	if res.code != 0 || res.stdout != expected || res.stderr != "" {
+		t.Fatalf("plan: code=%d stdout=%q want %q stderr=%q", res.code, res.stdout, expected, res.stderr)
+	}
+	if !strings.Contains(res.stdout, `"cpu":2`) {
+		t.Fatalf("plan output does not carry the resolved value: %q", res.stdout)
+	}
+}
