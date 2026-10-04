@@ -270,16 +270,18 @@ func (b *stateBackend) handleApply(source providerSource) http.HandlerFunc {
 		}
 
 		// The configuration is validated exactly like the plan endpoint's,
-		// with findings rooted at /configuration.
+		// with findings rooted at /configuration, and planned from its
+		// variable-resolved view so the committed state holds literal
+		// properties only.
 		var errs []validationError
 		var configResources []planResource
 		var configOrder []string
-		if baseErrs := validateConfiguration(configRaw); len(baseErrs) != 0 {
+		if resolved, baseErrs := resolveConfiguration(configRaw); len(baseErrs) != 0 {
 			errs = appendPrefixedErrors(errs, baseErrs, "/configuration")
 		} else if order, depErrs := orderConfiguration(configRaw); len(depErrs) != 0 {
 			errs = appendPrefixedErrors(errs, depErrs, "/configuration")
 		} else {
-			configResources = configurationResources(configRaw)
+			configResources = configurationResources(resolved)
 			configOrder = order
 		}
 		if len(errs) != 0 {

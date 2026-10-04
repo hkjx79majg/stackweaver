@@ -94,16 +94,18 @@ func preparePlan(w http.ResponseWriter, r *http.Request) (changes []planChange, 
 
 	// Configuration and prior state are validated independently; their
 	// findings are merged and sorted together. Configuration findings keep
-	// their codes and gain a /configuration path prefix.
+	// their codes and gain a /configuration path prefix. The configuration
+	// is planned from its variable-resolved view, so snapshots, state, and
+	// Provider requests only ever carry literal properties.
 	var errs []validationError
 	var configResources []planResource
 	var configOrder []string
-	if baseErrs := validateConfiguration(configRaw); len(baseErrs) != 0 {
+	if resolved, baseErrs := resolveConfiguration(configRaw); len(baseErrs) != 0 {
 		errs = appendPrefixedErrors(errs, baseErrs, "/configuration")
 	} else if order, depErrs := orderConfiguration(configRaw); len(depErrs) != 0 {
 		errs = appendPrefixedErrors(errs, depErrs, "/configuration")
 	} else {
-		configResources = configurationResources(configRaw)
+		configResources = configurationResources(resolved)
 		configOrder = order
 	}
 

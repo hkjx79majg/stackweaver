@@ -120,6 +120,18 @@ func pointerEscape(s string) string {
 // validateConfiguration checks a decoded document and returns every
 // independently determinable problem, in discovery order.
 func validateConfiguration(doc any) []validationError {
+	_, errs := resolveConfiguration(doc)
+	return errs
+}
+
+// resolveConfiguration validates a decoded configuration document exactly
+// like validateConfiguration and additionally returns the resolved view of
+// the document: every variable reference inside resource properties is
+// replaced by the referenced variable's literal value. A document naming
+// neither variables nor variableValues is returned unchanged, so historical
+// configurations keep their exact behavior. The resolved document is
+// meaningful only when the returned error list is empty.
+func resolveConfiguration(doc any) (any, []validationError) {
 	var errs []validationError
 	add := func(code, message, path string) {
 		errs = append(errs, validationError{Code: code, Message: message, Path: path})
@@ -128,10 +140,10 @@ func validateConfiguration(doc any) []validationError {
 	root, ok := doc.(map[string]any)
 	if !ok {
 		add(codeInvalidDocument, "document must be a JSON object", "")
-		return errs
+		return nil, errs
 	}
 	for key := range root {
-		if key != "resourceTypes" && key != "resources" {
+		if key != "resourceTypes" && key != "resources" && key != "variables" && key != "variableValues" {
 			add(codeInvalidDocument, fmt.Sprintf("unknown field %q", key), "/"+pointerEscape(key))
 		}
 	}
@@ -201,6 +213,44 @@ func validateConfiguration(doc any) []validationError {
 		}
 	}
 
+	// The variable phase runs before property validation, dependency
+	// ordering, and diff computation: references inside resource properties
+	// are resolved against the declared variables and explicit values, and
+	// any problem it finds suppresses property validation, because
+	// unresolved properties cannot be checked against their schemas.
+	variableErrs := len(errs)
+	decls, variablesActive := checkVariableDeclarations(root, add)
+	resolved := doc
+	var resolvedEntries []any
+	if variablesActive {
+		resolvedEntries = make([]any, len(resourceEntries))
+		for i, entry := range resourceEntries {
+			obj, ok := entry.(map[string]any)
+			if !ok {
+				resolvedEntries[i] = entry
+				continue
+			}
+			props, ok := obj["properties"].(map[string]any)
+			if !ok {
+				resolvedEntries[i] = entry
+				continue
+			}
+			resolvedObj := make(map[string]any, len(obj))
+			for key, value := range obj {
+				resolvedObj[key] = value
+			}
+			resolvedObj["properties"] = resolveVariableReferences(props, fmt.Sprintf("/resources/%d/properties", i), decls, add)
+			resolvedEntries[i] = resolvedObj
+		}
+		resolvedRoot := make(map[string]any, len(root))
+		for key, value := range root {
+			resolvedRoot[key] = value
+		}
+		resolvedRoot["resources"] = resolvedEntries
+		resolved = resolvedRoot
+	}
+	variablesOK := len(errs) == variableErrs
+
 	seenAddresses := map[string]bool{}
 	for i, entry := range resourceEntries {
 		entryPath := fmt.Sprintf("/resources/%d", i)
@@ -246,12 +296,30 @@ func validateConfiguration(doc any) []validationError {
 			add(codeInvalidDocument, `"properties" must be an object`, entryPath+"/properties")
 			continue
 		}
-		if schemaUsable {
-			validateValue(props, schema, entryPath+"/properties", add)
+		if schemaUsable && variablesOK {
+			// Properties are validated against their schema only after
+			// variable resolution has replaced every reference with its
+			// literal value.
+			validateValue(resolvedPropertiesOf(resolvedEntries, i, props), schema, entryPath+"/properties", add)
 		}
 	}
 
-	return errs
+	return resolved, errs
+}
+
+// resolvedPropertiesOf returns the variable-resolved properties of resource
+// entry i, falling back to the original properties when the variable phase
+// was inactive for the document.
+func resolvedPropertiesOf(resolvedEntries []any, i int, props map[string]any) map[string]any {
+	if resolvedEntries == nil {
+		return props
+	}
+	if obj, ok := resolvedEntries[i].(map[string]any); ok {
+		if resolved, ok := obj["properties"].(map[string]any); ok {
+			return resolved
+		}
+	}
+	return props
 }
 
 // identifierField extracts a required non-empty string field, reporting
