@@ -55,6 +55,14 @@ Apply 返回普通错误或 `Retryable()` 为 false 时沿用上述现状（立�
 
 上述规则一致覆盖 `POST /v1/apply`、`POST /v1/state/apply` 与 `POST /v1/state/reconcile`，并同时适用于按资源类型分派的多 Provider 模式。
 
+### 失败补偿（仅 POST /v1/apply）
+
+`POST /v1/apply` 的请求信封在 `configuration`、`priorState` 之外接受可选布尔字段 `rollbackOnError`。字段缺省或为 `false` 时，上述校验、顺序、响应与部分失败语义完全不变；其他公开入口（含 `POST /v1/plans`、`POST /v1/state/apply`、CLI）不接受该字段，出现时按未知字段返回 422 `invalid_plan_request`（path 为 `/rollbackOnError`）。`rollbackOnError` 出现但不是布尔值（含 `null`、字符串、数字、数组、对象）时同样返回 422 `invalid_plan_request`、path 为 `/rollbackOnError`，且不调用任何 Provider。
+
+`rollbackOnError` 为 `true` 时仍按原计划顺序执行全部非 noop 变更；某项在既有重试规则下最终失败后停止后续项，并对**已成功**的变更按成功顺序的逆序逐项补偿：`create` 转为携带其 after 快照的 `delete`，`delete` 转为携带其 before 快照的 `create`，`update` 转为交换 before 与 after 的另一次 `update`。多 Provider 模式下补偿按其目标快照类型路由（因此类型变化的 update 通过原类型的 Provider 撤销）；执行前除全部正向路由外还预检全部可能的补偿路由，任一路由缺失即返回 503 `provider_unavailable`、path 为原计划 `/changes/{索引}`，且不调用任何 Provider。每次补偿使用本请求内唯一的非空新幂等键（与全部正向键互不相同），同一补偿的各次重试复用该键，`attempt` 仍为 1 至 3，并沿用 `RetryableError` 与请求 context 规则（准备重试前 context 已结束则以 `context.Err()` 文本作为补偿错误）。
+
+正向失败仍返回 502，`errors` 保留唯一的 `provider_error`、最终错误文本与原变更路径 `/changes/{索引}`；启用补偿的响应始终额外包含 `rolledBack` 与 `rollbackErrors` 两个数组。`rolledBack` 按补偿的实际执行顺序列出已成功撤销的原变更；某项补偿最终失败时，在 `rollbackErrors` 中记录 `rollback_error`、最终错误文本与 `/rollbacks/{原变更索引}`，随后继续处理更早的成功项而不中断整轮补偿。`applied` 仅保留补偿后仍生效的残留正向变更并维持原执行顺序；`state` 等于在规范化 `priorState` 上依次应用这些残留变更的确定结果，全部补偿成功时 `applied` 为空且 `state` 与规范化 `priorState` 逐字节等价。`summary` 始终反映原计划、不因补偿改变；正向全部成功时不执行任何补偿，两个数组均为空，其余成功响应字段保持现状。预检失败（422/503）的响应与基线一样不包含 `applied`、`rolledBack` 与 `rollbackErrors`。
+
 ## 状态文件
 
 `server.HandlerWithProviderAndStateFile(provider, path)` 在上述表面之外增加文件状态后端，执行结果成为后续请求的输入：

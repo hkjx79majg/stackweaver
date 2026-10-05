@@ -74,8 +74,26 @@ var idempotencyCounter atomic.Uint64
 // non-noop change of a new top-level request. A later top-level request
 // mints a fresh set, so keys are never reused across requests.
 func mintIdempotencyKeys(n int) []string {
+	return mintKeys(n, nil)
+}
+
+// mintAdditionalKeys allocates n more non-empty, pairwise-distinct keys for
+// the same top-level request, disjoint from every key already minted for it
+// (the forward changes' keys). It backs the compensation keys of a
+// rollback-enabled run, so each compensation key is unique within the whole
+// request while retries of one compensation reuse its key.
+func mintAdditionalKeys(n int, existing []string) []string {
+	return mintKeys(n, existing)
+}
+
+// mintKeys allocates n distinct non-empty keys, seeded with the keys already
+// used by the same request so the returned set is disjoint from them.
+func mintKeys(n int, existing []string) []string {
 	keys := make([]string, n)
-	seen := make(map[string]struct{}, n)
+	seen := make(map[string]struct{}, n+len(existing))
+	for _, key := range existing {
+		seen[key] = struct{}{}
+	}
 	for i := range keys {
 		for {
 			key := "sw-" + randKey()

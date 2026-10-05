@@ -42,6 +42,8 @@ type applyResult struct {
 	State   *struct {
 		Resources []stateResource `json:"resources"`
 	} `json:"state"`
+	RolledBack     *[]planChange      `json:"rolledBack"`
+	RollbackErrors *[]validationError `json:"rollbackErrors"`
 }
 
 func doApply(t *testing.T, handler http.Handler, body string, ctx context.Context) applyResult {

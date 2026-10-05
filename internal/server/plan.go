@@ -60,7 +60,7 @@ func handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	changes, summary, _, ok := preparePlan(w, r)
+	changes, summary, _, _, ok := preparePlan(w, r, false)
 	if !ok {
 		return
 	}
@@ -81,15 +81,19 @@ func handlePlan(w http.ResponseWriter, r *http.Request) {
 // caller never invokes a Provider for an invalid request. On success it also
 // returns the validated prior-state resources, used to seed the resulting
 // state of an apply run.
-func preparePlan(w http.ResponseWriter, r *http.Request) (changes []planChange, summary planSummary, stateResources []planResource, ok bool) {
+//
+// allowRollback switches on the apply-only optional rollbackOnError envelope
+// field; the read-only plan endpoint passes false, so the field is an unknown
+// field there exactly like any other non-envelope key.
+func preparePlan(w http.ResponseWriter, r *http.Request, allowRollback bool) (changes []planChange, summary planSummary, stateResources []planResource, rollbackOnError bool, ok bool) {
 	doc, ok := decodeConfigurationBody(w, r)
 	if !ok {
-		return nil, planSummary{}, nil, false
+		return nil, planSummary{}, nil, false, false
 	}
 
-	configRaw, stateRaw, ok := checkPlanEnvelope(w, doc)
+	configRaw, stateRaw, rollbackOnError, ok := checkPlanEnvelope(w, doc, allowRollback)
 	if !ok {
-		return nil, planSummary{}, nil, false
+		return nil, planSummary{}, nil, false, false
 	}
 
 	// Configuration and prior state are validated independently; their
@@ -115,11 +119,11 @@ func preparePlan(w http.ResponseWriter, r *http.Request) (changes []planChange, 
 	if len(errs) != 0 {
 		sortValidationErrors(errs)
 		writeValidation(w, http.StatusUnprocessableEntity, errs)
-		return nil, planSummary{}, nil, false
+		return nil, planSummary{}, nil, false, false
 	}
 
 	changes, summary = computePlan(configResources, configOrder, stateResources, stateOrder)
-	return changes, summary, stateResources, true
+	return changes, summary, stateResources, rollbackOnError, true
 }
 
 // rejectMethodNotAllowed writes the shared 405 response for the POST-only
@@ -133,9 +137,10 @@ func rejectMethodNotAllowed(w http.ResponseWriter) {
 }
 
 // checkPlanEnvelope validates the request envelope: a JSON object holding
-// exactly the configuration and priorState fields. On failure it writes the
-// 422 response and returns ok=false.
-func checkPlanEnvelope(w http.ResponseWriter, doc any) (configuration, priorState any, ok bool) {
+// exactly the configuration and priorState fields, plus the apply-only
+// optional rollbackOnError boolean when allowRollback is set. On failure it
+// writes the 422 response and returns ok=false.
+func checkPlanEnvelope(w http.ResponseWriter, doc any, allowRollback bool) (configuration, priorState any, rollbackOnError bool, ok bool) {
 	var errs []validationError
 	add := func(code, message, path string) {
 		errs = append(errs, validationError{Code: code, Message: message, Path: path})
@@ -146,7 +151,7 @@ func checkPlanEnvelope(w http.ResponseWriter, doc any) (configuration, priorStat
 		add(codeInvalidPlanRequest, "request body must be a JSON object", "")
 	} else {
 		for key := range root {
-			if key != "configuration" && key != "priorState" {
+			if key != "configuration" && key != "priorState" && !(allowRollback && key == "rollbackOnError") {
 				add(codeInvalidPlanRequest, fmt.Sprintf("unknown field %q", key), "/"+pointerEscape(key))
 			}
 		}
@@ -159,14 +164,25 @@ func checkPlanEnvelope(w http.ResponseWriter, doc any) (configuration, priorStat
 		if !hasState {
 			add(codeInvalidPlanRequest, `missing required field "priorState"`, "")
 		}
+		// Absent or false keeps the baseline behavior; any present
+		// non-boolean (including null) is rejected before any Provider is
+		// called.
+		if raw, present := root["rollbackOnError"]; present && allowRollback {
+			value, isBool := raw.(bool)
+			if !isBool {
+				add(codeInvalidPlanRequest, `"rollbackOnError" must be a boolean`, "/rollbackOnError")
+			} else {
+				rollbackOnError = value
+			}
+		}
 	}
 
 	if len(errs) != 0 {
 		sortValidationErrors(errs)
 		writeValidation(w, http.StatusUnprocessableEntity, errs)
-		return nil, nil, false
+		return nil, nil, false, false
 	}
-	return configuration, priorState, true
+	return configuration, priorState, rollbackOnError, true
 }
 
 // appendPrefixedErrors appends errs to dst with every path rooted at prefix,

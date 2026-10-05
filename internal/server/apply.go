@@ -12,6 +12,7 @@ import (
 const (
 	codeProviderUnavailable = "provider_unavailable"
 	codeProviderError       = "provider_error"
+	codeRollbackError       = "rollback_error"
 )
 
 type stateDocument struct {
@@ -32,6 +33,11 @@ type applyResponse struct {
 	Applied *[]planChange     `json:"applied,omitempty"`
 	Summary planSummary       `json:"summary"`
 	State   *stateDocument    `json:"state,omitempty"`
+	// RolledBack and RollbackErrors are present only on runs requested with
+	// rollbackOnError=true that reach execution (200/502), even when empty.
+	// Baseline runs and pre-execution aborts omit them, exactly like applied.
+	RolledBack     *[]planChange      `json:"rolledBack,omitempty"`
+	RollbackErrors *[]validationError `json:"rollbackErrors,omitempty"`
 }
 
 // handleApply validates and plans a request exactly like POST /v1/plans, then
@@ -46,7 +52,7 @@ func handleApply(source providerSource) http.HandlerFunc {
 			return
 		}
 
-		changes, summary, priorResources, ok := preparePlan(w, r)
+		changes, summary, priorResources, rollbackOnError, ok := preparePlan(w, r, true)
 		if !ok {
 			// preparePlan already wrote the 400/422 response; a Provider is
 			// never called for an invalid request.
@@ -55,7 +61,10 @@ func handleApply(source providerSource) http.HandlerFunc {
 
 		// Precheck: every change must route to a registered Provider before
 		// anything executes. An unroutable change aborts the whole run
-		// without calling any Provider; an empty plan needs none.
+		// without calling any Provider; an empty plan needs none. When
+		// rollback is requested, each change's possible compensation is
+		// prechecked as well, so compensation can never discover a missing
+		// route after a forward change has landed.
 		providers := make([]Provider, len(changes))
 		for i, change := range changes {
 			typ := changeType(change)
@@ -70,6 +79,19 @@ func handleApply(source providerSource) http.HandlerFunc {
 				return
 			}
 			providers[i] = provider
+
+			if rollbackOnError {
+				rollbackType := changeType(compensationOf(change))
+				if _, registered := source.providerFor(rollbackType); !registered {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(applyResponse{
+						Valid:   false,
+						Errors:  []validationError{source.applyUnavailable(rollbackType, i)},
+						Summary: summary,
+					})
+					return
+				}
+			}
 		}
 
 		// State starts from priorState and is mutated only as changes
@@ -79,39 +101,132 @@ func handleApply(source providerSource) http.HandlerFunc {
 
 		// One fresh idempotency key per non-noop change of this top-level
 		// request; retries of a change reuse its key, and a later request
-		// mints a new set.
+		// mints a new set. When rollback is requested a second, disjoint set
+		// is minted up front, one per possible compensation; retries of one
+		// compensation reuse its key, and every forward and compensation key
+		// is unique within this request. Unused compensation keys never
+		// reach a Provider.
 		keys := mintIdempotencyKeys(len(changes))
+		var rollbackKeys []string
+		if rollbackOnError {
+			rollbackKeys = mintAdditionalKeys(len(changes), keys)
+		}
 
+		failIndex := -1
+		var forwardErr error
 		for i, change := range changes {
 			// computePlan only emits create/update/delete; noops are absent
 			// from the list, so a Provider is never invoked for them.
 			if err := executeChange(r.Context(), providers[i], change, keys[i]); err != nil {
-				// Stop immediately: later changes are skipped, earlier ones
-				// are not rolled back. A retryable error exhausted the
-				// attempt budget or turned non-retryable; either way the last
-				// error text is reported at the change's global index.
-				w.WriteHeader(http.StatusBadGateway)
-				_ = json.NewEncoder(w).Encode(applyResponse{
-					Valid:   false,
-					Errors:  []validationError{{Code: codeProviderError, Message: err.Error(), Path: fmt.Sprintf("/changes/%d", i)}},
-					Applied: &applied,
-					Summary: summary,
-					State:   renderState(state),
-				})
-				return
+				// Stop immediately: later changes are skipped. Without
+				// rollback, earlier changes stay in place; with rollback the
+				// successful changes are compensated below. Either way the
+				// last error text is reported at the change's global index.
+				failIndex = i
+				forwardErr = err
+				break
 			}
 			applied = append(applied, change)
 			applyToState(state, change)
 		}
 
-		w.WriteHeader(http.StatusOK)
+		if failIndex == -1 {
+			resp := applyResponse{
+				Valid:   true,
+				Errors:  []validationError{},
+				Applied: &applied,
+				Summary: summary,
+				State:   renderState(state),
+			}
+			if rollbackOnError {
+				// Every forward change succeeded: no compensation runs, but
+				// the two arrays are always present on a rollback-enabled run
+				// that reached execution.
+				resp.RolledBack = &[]planChange{}
+				resp.RollbackErrors = &[]validationError{}
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		if !rollbackOnError {
+			// Baseline partial-failure response: successful changes stay
+			// applied and state keeps their effects.
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(applyResponse{
+				Valid:   false,
+				Errors:  []validationError{{Code: codeProviderError, Message: forwardErr.Error(), Path: fmt.Sprintf("/changes/%d", failIndex)}},
+				Applied: &applied,
+				Summary: summary,
+				State:   renderState(state),
+			})
+			return
+		}
+
+		// Compensate the successful changes in reverse execution order. A
+		// compensation failure is recorded against /rollbacks/{original
+		// index} but never aborts the sweep: every earlier success still
+		// gets its turn. rolledBack follows the actual compensation order.
+		rolledBack := []planChange{}
+		rollbackErrors := []validationError{}
+		undone := map[int]bool{}
+		for j := failIndex - 1; j >= 0; j-- {
+			comp := compensationOf(changes[j])
+			compProvider, _ := source.providerFor(changeType(comp))
+			if err := executeChange(r.Context(), compProvider, comp, rollbackKeys[j]); err != nil {
+				rollbackErrors = append(rollbackErrors, validationError{
+					Code:    codeRollbackError,
+					Message: err.Error(),
+					Path:    fmt.Sprintf("/rollbacks/%d", j),
+				})
+				continue
+			}
+			undone[j] = true
+			rolledBack = append(rolledBack, changes[j])
+		}
+
+		// applied keeps only the changes still in effect after compensation,
+		// in the original execution order; state is the deterministic result
+		// of applying those residual changes to the normalized prior state,
+		// so a fully successful compensation reproduces the prior state.
+		residual := []planChange{}
+		finalState := seedState(priorResources)
+		for j := 0; j < failIndex; j++ {
+			if undone[j] {
+				continue
+			}
+			residual = append(residual, changes[j])
+			applyToState(finalState, changes[j])
+		}
+
+		w.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(w).Encode(applyResponse{
-			Valid:   true,
-			Errors:  []validationError{},
-			Applied: &applied,
-			Summary: summary,
-			State:   renderState(state),
+			Valid:          false,
+			Errors:         []validationError{{Code: codeProviderError, Message: forwardErr.Error(), Path: fmt.Sprintf("/changes/%d", failIndex)}},
+			Applied:        &residual,
+			Summary:        summary,
+			State:          renderState(finalState),
+			RolledBack:     &rolledBack,
+			RollbackErrors: &rollbackErrors,
 		})
+	}
+}
+
+// compensationOf inverts one planned change: create is undone with a delete
+// carrying the created snapshot, delete with a create carrying the removed
+// snapshot, and update with another update whose before and after are
+// exchanged. The compensation routes by the type of the snapshot it acts
+// toward, so a type-changing update is undone through the original type's
+// Provider.
+func compensationOf(change planChange) planChange {
+	switch change.Action {
+	case "create":
+		return planChange{Address: change.Address, Action: "delete", Before: change.After}
+	case "delete":
+		return planChange{Address: change.Address, Action: "create", After: change.Before}
+	default: // update
+		return planChange{Address: change.Address, Action: "update", Before: change.After, After: change.Before}
 	}
 }
 
